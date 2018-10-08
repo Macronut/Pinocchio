@@ -10,20 +10,22 @@ import (
 )
 
 const (
-	Direct  = 0x00
-	HTTP    = 0x02
-	HTTPS   = 0x03
-	IPv6to4 = 0x04
-	Socks5  = 0x05
-	IPv4to6 = 0x06
+	Direct = iota
+	HTTP
+	HTTPS
+	IPv6to4
+	Socks5
+	IPv4to6
 
-	MOVE    = 0x07
-	MOVETFO = 0x08
-	BIND    = 0x09
-	BINDTFO = 0x0A
-	TTL     = 0x0B
-	TTLS    = 0x0C
-	TFO     = 0x0D
+	MOVE
+	MOVETFO
+	BIND
+	BINDTFO
+	TTL
+	TTLS
+	TFO
+
+	TYPE_COUNT
 )
 
 const (
