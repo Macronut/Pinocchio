@@ -1,9 +1,13 @@
 package dns
 
 import (
+	"crypto/tls"
+	"encoding/base64"
 	"encoding/binary"
-	//"log"
+	"encoding/json"
+	"io/ioutil"
 	"net"
+	"net/http"
 	"strings"
 )
 
@@ -32,13 +36,15 @@ const (
 )
 
 const (
-	ADDRESS = 0
-	UDP     = 1
-	TCP     = 2
+	UDP   = 0
+	TCP   = 1
+	HTTP  = 2
+	HTTPS = 3
+	DOH   = 4
 )
 
 type Question struct {
-	QName  []byte
+	QName  string
 	QType  uint16
 	QClass uint16
 }
@@ -57,26 +63,23 @@ func UnpackHeader(buf []byte) (Header, int) {
 
 func UnpackQuestion(buf []byte) (Question, int) {
 	off := 0
-	//QName := make([]byte, 256)
-	for {
+	n := len(buf)
+	for off < n {
 		length := buf[off]
 		off++
 		if length == 0x00 {
 			break
 		}
 		end := off + int(length)
-		/*
-			if off > 1 {
-				QName[off-2] = '.'
-			}
-			copy(QName[off-1:], buf[off:end])
-		*/
 		off = end
 	}
 
+	if off+4 > n {
+		return Question{"", 0, 0}, 0
+	}
+
 	question := Question{
-		//string(QName),
-		buf[:off],
+		UnPackQName(buf[:off]),
 		binary.BigEndian.Uint16(buf[off : off+2]),
 		binary.BigEndian.Uint16(buf[off+2 : off+4]),
 	}
@@ -103,6 +106,68 @@ func PackQName(name string) []byte {
 	return QName
 }
 
+func UnPackQName(qname []byte) string {
+	if qname[0] == 0x00 {
+		return ""
+	}
+	Name := make([]byte, len(qname)-2)
+	length := qname[0]
+	off := 1
+	end := off + int(length)
+	copy(Name[off-1:], qname[off:end])
+	for {
+		off = end
+		length := qname[off]
+		if length == 0x00 {
+			break
+		}
+		Name[off-1] = '.'
+		off++
+		end = off + int(length)
+		copy(Name[off-1:], qname[off:end])
+	}
+
+	return string(Name)
+}
+
+func UnPackAnswers(answers []byte, count int) []net.TCPAddr {
+	IPList := make([]net.TCPAddr, 0)
+	offset := 0
+	for i := 0; i < count; i++ {
+		for {
+			length := binary.BigEndian.Uint16(answers[offset : offset+2])
+			offset += 2
+			if length > 0 && length < 63 {
+				offset += int(length)
+				if offset > len(answers)-2 {
+					return nil
+				}
+			} else {
+				break
+			}
+		}
+		AType := binary.BigEndian.Uint16(answers[offset : offset+2])
+		offset += 4
+		ttl := binary.BigEndian.Uint32(answers[offset : offset+4])
+		offset += 4
+		DataLength := binary.BigEndian.Uint16(answers[offset : offset+2])
+		offset += 2
+
+		if AType == TypeA {
+			data := answers[offset : offset+4]
+			TCPAddr := &net.TCPAddr{data, int(ttl), ""}
+			IPList = append(IPList, *TCPAddr)
+		} else if AType == TypeAAAA {
+			data := answers[offset : offset+16]
+			TCPAddr := &net.TCPAddr{data, int(ttl), ""}
+			IPList = append(IPList, *TCPAddr)
+		}
+		offset += int(DataLength)
+	}
+
+	return IPList
+}
+
 type Resource struct {
 	Name     []byte
 	Type     uint16
@@ -119,15 +184,18 @@ type Answers struct {
 	Answers []byte
 }
 
+var NoAnswer Answers = Answers{0, 0, 0, nil}
+
 func PackAnswers(IPList []net.IP) Answers {
 	answers := make([]byte, 1024)
 	length := 0
 	for _, ip := range IPList {
-		if ip[0] == 0x00 {
+		ip4 := ip.To4()
+		if ip4 != nil {
 			//A
 			answer := []byte{0xC0, 0x0C, 0x00, byte(TypeA),
 				0x00, 0x01, 0x00, 0x00, 0x0E, 0x10, 0x00, 0x04,
-				ip[12], ip[13], ip[14], ip[15]}
+				ip4[0], ip4[1], ip4[2], ip4[3]}
 			copy(answers[length:], answer)
 			length += 16
 		} else {
@@ -142,7 +210,64 @@ func PackAnswers(IPList []net.IP) Answers {
 	return Answers{uint16(len(IPList)), 0, 0, answers[:length]}
 }
 
-func PackResponse(Request []byte, answers Answers) []byte {
+func PackAnswersTTL(IPList []net.TCPAddr) Answers {
+	answers := make([]byte, 1024)
+	length := 0
+	for _, addr := range IPList {
+		ip4 := addr.IP.To4()
+		if ip4 != nil {
+			answer := []byte{
+				0xC0, 0x0C,
+				0x00, byte(TypeA),
+				0x00, 0x01,
+				0x00, 0x00, 0x00, 0x00,
+				0x00, 0x04,
+				ip4[0], ip4[1], ip4[2], ip4[3]}
+			binary.BigEndian.PutUint32(answer[6:], uint32(addr.Port))
+			copy(answers[length:], answer)
+			length += 16
+		} else {
+			answer := []byte{
+				0xC0, 0x0C,
+				0x00, byte(TypeAAAA),
+				0x00, 0x01,
+				0x00, 0x00, 0x00, 0x00,
+				0x00, 0x10}
+			binary.BigEndian.PutUint32(answer[6:], uint32(addr.Port))
+			copy(answers[length:], answer)
+			length += 12
+			copy(answers[length:], addr.IP)
+			length += 16
+		}
+	}
+	return Answers{uint16(len(IPList)), 0, 0, answers[:length]}
+}
+
+func BuildLie(ID int, Type uint16) Answers {
+	answers := make([]byte, 1024)
+	length := 0
+	if Type == TypeA {
+		answer := []byte{0xC0, 0x0C, 0x00, byte(TypeA),
+			0x00, 0x01, 0x00, 0x00, 0x00, 0x10, 0x00, 0x04,
+			100, 64}
+		copy(answers[length:], answer)
+		length += 14
+		binary.BigEndian.PutUint16(answers[length:], uint16(ID))
+		length += 2
+	} else if Type == TypeAAAA {
+		answer := []byte{0xC0, 0x0C, 0x00, byte(TypeAAAA),
+			0x00, 0x01, 0x00, 0x00, 0x00, 0x10, 0x00, 0x10,
+			0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00}
+		copy(answers[length:], answer)
+		length += 24
+		binary.BigEndian.PutUint32(answers[length:], uint32(ID))
+		length += 4
+	}
+	return Answers{1, 0, 0, answers[:length]}
+}
+
+func QuickResponse(Request []byte, answers Answers) []byte {
 	length := len(Request)
 	Response := make([]byte, 1024)
 	copy(Response, Request)
@@ -157,4 +282,124 @@ func PackResponse(Request []byte, answers Answers) []byte {
 	}
 
 	return Response[:length]
+}
+
+func PackRequest(header Header, question Question) []byte {
+	Request := make([]byte, 512)
+	binary.BigEndian.PutUint16(Request[:], header.ID)
+	binary.BigEndian.PutUint16(Request[2:], header.Flag)
+	//Request[2] = 0x81
+	//Request[3] = 0x80
+	binary.BigEndian.PutUint16(Request[4:], header.QDCount)
+	binary.BigEndian.PutUint16(Request[6:], header.ANCount)
+	binary.BigEndian.PutUint16(Request[8:], header.NSCount)
+	binary.BigEndian.PutUint16(Request[10:], header.ARCount)
+	qname := PackQName(question.QName)
+	length := len(qname)
+	copy(Request[12:], qname)
+	length += 12
+	binary.BigEndian.PutUint16(Request[length:], question.QType)
+	length += 2
+	binary.BigEndian.PutUint16(Request[length:], question.QClass)
+	length += 2
+
+	return Request[:length]
+}
+
+func PackResponse(header Header, question Question, answers Answers) []byte {
+	Response := make([]byte, 1024)
+	binary.BigEndian.PutUint16(Response[:], header.ID)
+	Response[2] = 0x81
+	Response[3] = 0x80
+	binary.BigEndian.PutUint16(Response[4:], header.QDCount)
+	binary.BigEndian.PutUint16(Response[6:], answers.ANCount)
+	binary.BigEndian.PutUint16(Response[8:], answers.NSCount)
+	binary.BigEndian.PutUint16(Response[10:], answers.ARCount)
+	qname := PackQName(question.QName)
+	length := len(qname)
+	copy(Response[12:], qname)
+	length += 12
+	binary.BigEndian.PutUint16(Response[length:], question.QType)
+	length += 2
+	binary.BigEndian.PutUint16(Response[length:], question.QClass)
+	length += 2
+	if answers.ANCount > 0 {
+		copy(Response[length:], answers.Answers)
+		length += len(answers.Answers)
+	}
+
+	return Response[:length]
+}
+
+func HTTPSLookup(qname string, qtype uint16) ([]net.TCPAddr, error) {
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	httpsClient := &http.Client{
+		Transport: tr,
+	}
+	var url string
+
+	switch qtype {
+	case TypeA:
+		url = "https://dns.google.com/resolve?name=" + qname
+	case TypeAAAA:
+		url = "https://dns.google.com/resolve?name=" + qname + "&type=AAAA"
+	default:
+		return nil, nil
+	}
+
+	resp, err := httpsClient.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	type Answer struct {
+		Name string `json:"name"`
+		Type uint16 `json:"type"`
+		TTL  int    `json:"TTL"`
+		Data string `json:"data"`
+	}
+
+	type DNSHTTP struct {
+		Answer []Answer
+	}
+
+	var HTTPAnswer = new(DNSHTTP)
+	err = json.Unmarshal(body, &HTTPAnswer)
+	if err != nil {
+		return nil, err
+	}
+
+	//IPList := []net.IP{}
+	IPList := make([]net.TCPAddr, 0)
+	for _, ans := range HTTPAnswer.Answer {
+		if ans.Type == qtype {
+			//var ip net.IP = net.ParseIP(ans.Data)
+			IPList = append(IPList, net.TCPAddr{net.ParseIP(ans.Data), ans.TTL, ""})
+		}
+	}
+	return IPList, nil
+}
+
+func DoHLookup(request []byte, host string) ([]byte, error) {
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	httpsClient := &http.Client{
+		Transport: tr,
+	}
+	url := host + base64.URLEncoding.EncodeToString(request)
+
+	resp, err := httpsClient.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	response, err := ioutil.ReadAll(resp.Body)
+	copy(response[:], request[:2])
+	return response, nil
 }
