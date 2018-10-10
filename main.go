@@ -50,6 +50,7 @@ var ProxyAddress net.TCPAddr
 var ProxyClients map[string]bool
 var Nose []DNSTruth = []DNSTruth{DNSTruth{"pinocchio", nil}}
 var DNSMode int = 0
+var DNSMinTTL int = 3600
 var LogEnable bool = false
 var DNSAddress *net.UDPAddr
 
@@ -340,7 +341,7 @@ func handleDNSForward(server *net.UDPConn, client *net.UDPConn, clientsList *[]*
 			qname := question.QName
 			adata := make([]byte, n-offset)
 			copy(adata, data[offset:n])
-			answers := dns.Answers{header.ANCount, header.NSCount, header.ARCount, adata}
+			answers := dns.Answers{time.Now().Unix() + int64(DNSMinTTL), header.ANCount, header.NSCount, header.ARCount, adata}
 			var cache DNSCache
 			if clientInfo.Cache == nil {
 				cache = DNSCache{nil, nil, nil, nil}
@@ -417,7 +418,7 @@ func handleUDPForward(id uint16, curCache *DNSCache, server *net.UDPConn, client
 				//cache, ok := CacheMap[qname]
 				adata := make([]byte, n-offset)
 				copy(adata, data[offset:n])
-				answers := dns.Answers{header.ANCount, header.NSCount, header.ARCount, adata}
+				answers := dns.Answers{time.Now().Unix() + int64(DNSMinTTL), header.ANCount, header.NSCount, header.ARCount, adata}
 
 				if question.QType == dns.TypeA {
 					cache.A = &answers
@@ -501,7 +502,7 @@ func handleDOHForward(header dns.Header, question dns.Question, curCache *DNSCac
 	var cache DNSCache = *curCache
 	if cache.Proxy == nil {
 		client.WriteToUDP(response, clientAddr)
-		answers := dns.Answers{header.ANCount, header.NSCount, header.ARCount, response[offset:]}
+		answers := dns.Answers{time.Now().Unix() + int64(DNSMinTTL), header.ANCount, header.NSCount, header.ARCount, response[offset:]}
 		if question.QType == dns.TypeA {
 			cache.A = &answers
 			CacheLock.Lock()
@@ -663,7 +664,10 @@ func NSLookup(qname string, qtype uint16, cache *DNSCache) []net.TCPAddr {
 							qname := string(question.QName)
 							adata := make([]byte, n-offset)
 							copy(adata, data[offset:n])
-							answers := dns.Answers{header.ANCount, header.NSCount, header.ARCount, adata}
+							answers := dns.Answers{
+								time.Now().Unix() + int64(DNSMinTTL),
+								header.ANCount, header.NSCount,
+								header.ARCount, adata}
 							if question.QType == dns.TypeA {
 								cache.A = &answers
 								CacheLock.Lock()
@@ -700,7 +704,9 @@ func NSLookup(qname string, qtype uint16, cache *DNSCache) []net.TCPAddr {
 					qname := string(question.QName)
 					adata := make([]byte, len(response)-offset)
 					copy(adata, response[offset:])
-					answers := dns.Answers{header.ANCount, header.NSCount, header.ARCount, adata}
+					answers := dns.Answers{time.Now().Unix() + int64(DNSMinTTL),
+						header.ANCount, header.NSCount,
+						header.ARCount, adata}
 					if question.QType == dns.TypeA {
 						cache.A = &answers
 						CacheLock.Lock()
@@ -753,7 +759,7 @@ func handleDNSServer(client *net.UDPConn, randport bool) {
 			continue
 		}
 
-		//startTime := time.Now()
+		Now := time.Now()
 		if n < 12 {
 			continue
 		}
@@ -777,57 +783,63 @@ func handleDNSServer(client *net.UDPConn, randport bool) {
 			answers = cache.AAAA
 		}
 
-		if answers == nil {
-			if cache.Server != nil {
-				switch (*cache.Server).Type {
-				case dns.UDP:
-					if randport {
-						addr, err := net.ResolveUDPAddr("udp", ":0")
-						server, err := net.ListenUDP("udp", addr)
+		if answers != nil {
+			response := dns.QuickResponse(data[:n], *answers)
+			client.WriteToUDP(response, clientAddr)
+			if Now.Unix() < answers.Expires {
+				continue
+			}
+		}
+
+		if cache.Server != nil {
+			if LogEnable {
+				log.Println(question.QName, question.QType, time.Since(Now))
+			}
+
+			switch (*cache.Server).Type {
+			case dns.UDP:
+				if randport {
+					addr, err := net.ResolveUDPAddr("udp", ":0")
+					server, err := net.ListenUDP("udp", addr)
+					if err != nil {
+						log.Println(err)
+						continue
+					}
+
+					for _, serverAddr := range (*cache.Server).AddrList {
+						_, err = server.WriteToUDP(data[:n], &serverAddr)
 						if err != nil {
 							log.Println(err)
 							continue
 						}
-
-						for _, serverAddr := range (*cache.Server).AddrList {
-							_, err = server.WriteToUDP(data[:n], &serverAddr)
-							if err != nil {
-								log.Println(err)
-								continue
-							}
-						}
-						go handleUDPForward(id, &cache, server, client, clientAddr)
-					} else {
-						clientsList[index] = &ClientInfo{id, time.Now().Unix(), clientAddr, &cache}
-						binary.BigEndian.PutUint16(data[:], index^idMask)
-						for _, serverAddr := range (*cache.Server).AddrList {
-							_, err = server.WriteToUDP(data[:n], &serverAddr)
-							if err != nil {
-								log.Println(err)
-								continue
-							}
-						}
-						index++
 					}
-					continue
-				case dns.TCP:
-					//TODO
-				case dns.HTTPS:
-					go handleHTTPSForward(header, question, &cache, client, clientAddr)
-					continue
-				case dns.DOH:
-					go handleDOHForward(header, question, &cache, client, clientAddr)
-					continue
+					go handleUDPForward(id, &cache, server, client, clientAddr)
+				} else {
+					clientsList[index] = &ClientInfo{id, time.Now().Unix(), clientAddr, &cache}
+					binary.BigEndian.PutUint16(data[:], index^idMask)
+					for _, serverAddr := range (*cache.Server).AddrList {
+						_, err = server.WriteToUDP(data[:n], &serverAddr)
+						if err != nil {
+							log.Println(err)
+							continue
+						}
+					}
+					index++
 				}
-				//log.Println(time.Since(startTime))
+				continue
+			case dns.TCP:
+				//TODO
+			case dns.HTTPS:
+				go handleHTTPSForward(header, question, &cache, client, clientAddr)
+				continue
+			case dns.DOH:
+				go handleDOHForward(header, question, &cache, client, clientAddr)
+				continue
 			}
+		}
 
-			if cache.Proxy != nil {
-				answers = AddLie(question, cache)
-				response := dns.QuickResponse(data[:n], *answers)
-				client.WriteToUDP(response, clientAddr)
-			}
-		} else {
+		if cache.Proxy != nil {
+			answers = AddLie(question, cache)
 			response := dns.QuickResponse(data[:n], *answers)
 			client.WriteToUDP(response, clientAddr)
 		}
@@ -1051,13 +1063,6 @@ func handleProxy(client *net.TCPConn) {
 			addrlist := NSLookup(host, 1, nil)
 			proxy.ProxyAddress(client, addrlist, port)
 		} else {
-			/*
-				if port == 443 {
-					proxy.ProxyTFO(client, net.JoinHostPort(host, strconv.Itoa(port)))
-				} else {
-					proxy.Proxy(client, net.JoinHostPort(host, strconv.Itoa(port)))
-				}
-			*/
 			proxy.Proxy(client, net.JoinHostPort(host, strconv.Itoa(port)))
 		}
 	} else {

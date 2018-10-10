@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"time"
 )
 
 type Header struct {
@@ -178,13 +179,15 @@ type Resource struct {
 }
 
 type Answers struct {
+	Expires int64
 	ANCount uint16
 	NSCount uint16
 	ARCount uint16
 	Answers []byte
 }
 
-var NoAnswer Answers = Answers{0, 0, 0, nil}
+var MaxExpires int64 = 0x7FFFFFFFFFFFFFFF
+var NoAnswer Answers = Answers{MaxExpires, 0, 0, 0, nil}
 
 func PackAnswers(IPList []net.IP) Answers {
 	answers := make([]byte, 1024)
@@ -207,13 +210,18 @@ func PackAnswers(IPList []net.IP) Answers {
 			length += 16
 		}
 	}
-	return Answers{uint16(len(IPList)), 0, 0, answers[:length]}
+	return Answers{MaxExpires, uint16(len(IPList)), 0, 0, answers[:length]}
 }
 
 func PackAnswersTTL(IPList []net.TCPAddr) Answers {
 	answers := make([]byte, 1024)
 	length := 0
+	minttl := 0x7FFFFFFF
 	for _, addr := range IPList {
+		ttl := addr.Port
+		if minttl > addr.Port {
+			minttl = addr.Port
+		}
 		ip4 := addr.IP.To4()
 		if ip4 != nil {
 			answer := []byte{
@@ -223,7 +231,7 @@ func PackAnswersTTL(IPList []net.TCPAddr) Answers {
 				0x00, 0x00, 0x00, 0x00,
 				0x00, 0x04,
 				ip4[0], ip4[1], ip4[2], ip4[3]}
-			binary.BigEndian.PutUint32(answer[6:], uint32(addr.Port))
+			binary.BigEndian.PutUint32(answer[6:], uint32(ttl))
 			copy(answers[length:], answer)
 			length += 16
 		} else {
@@ -233,14 +241,14 @@ func PackAnswersTTL(IPList []net.TCPAddr) Answers {
 				0x00, 0x01,
 				0x00, 0x00, 0x00, 0x00,
 				0x00, 0x10}
-			binary.BigEndian.PutUint32(answer[6:], uint32(addr.Port))
+			binary.BigEndian.PutUint32(answer[6:], uint32(ttl))
 			copy(answers[length:], answer)
 			length += 12
 			copy(answers[length:], addr.IP)
 			length += 16
 		}
 	}
-	return Answers{uint16(len(IPList)), 0, 0, answers[:length]}
+	return Answers{time.Now().Unix() + int64(minttl), uint16(len(IPList)), 0, 0, answers[:length]}
 }
 
 func BuildLie(ID int, Type uint16) Answers {
@@ -264,7 +272,7 @@ func BuildLie(ID int, Type uint16) Answers {
 		binary.BigEndian.PutUint32(answers[length:], uint32(ID))
 		length += 4
 	}
-	return Answers{1, 0, 0, answers[:length]}
+	return Answers{MaxExpires, 1, 0, 0, answers[:length]}
 }
 
 func QuickResponse(Request []byte, answers Answers) []byte {
