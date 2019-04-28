@@ -9,9 +9,9 @@ import (
 	"strings"
 )
 
-func HTTPProxyHost(serverAddrList []net.TCPAddr, client net.Conn, host string, port int) {
+func HTTPProxyHost(serverAddrList []AddrInfo, client net.Conn, host string, port int) {
 	addr, err := net.ResolveTCPAddr("tcp", ":0")
-	serverAddr := serverAddrList[rand.Intn(len(serverAddrList))]
+	serverAddr := serverAddrList[rand.Intn(len(serverAddrList))].Address
 	server, err := net.DialTCP("tcp", addr, &serverAddr)
 	if err != nil {
 		log.Println(err)
@@ -158,13 +158,12 @@ func HTTPProxyHost(serverAddrList []net.TCPAddr, client net.Conn, host string, p
 	}
 }
 
-func HTTPProxyAddr(serverAddrList []net.TCPAddr, client net.Conn, address *net.TCPAddr) {
+func HTTPProxyAddr(serverAddrList []AddrInfo, client net.Conn, address *net.TCPAddr) {
 	HTTPProxyHost(serverAddrList, client, address.IP.String(), address.Port)
 }
 
 func HTTPProxy(client net.Conn, request string) {
 	defer client.Close()
-	dataSize := -1
 
 	hoststart := strings.Index(request, " ")
 	if hoststart <= 0 {
@@ -175,36 +174,15 @@ func HTTPProxy(client net.Conn, request string) {
 	if hostend <= 0 {
 		return
 	}
-	hostend += hoststart
-	host := request[hoststart:hostend]
-	/*
-		port := 80
-		ipv6end := strings.Index(host, "]")
-		ipv6end++
-		portstart := strings.Index(host[ipv6end:], ":")
-		if portstart > -1 {
-			portstart += ipv6end
-			var err error
-			port, err = strconv.Atoi(host[portstart+1:])
-			if err != nil {
-				log.Println(err)
-				return
-			}
-			host = host[:portstart]
-		}
-
-		fmt.Println("HTTP", host, port)
-
-		server, err := net.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
-	*/
-	//fmt.Println("HTTP", host)
+	host := request[hoststart : hoststart+hostend]
+	addr := host
 	if len(host) == strings.Index(host, "]")+1 {
-		host += ":80"
+		addr += ":80"
 	} else if strings.Index(host, ":") == -1 {
-		host += ":80"
+		addr += ":80"
 	}
 
-	server, err := net.Dial("tcp", host)
+	server, err := net.Dial("tcp", addr)
 	if err != nil {
 		log.Println(err)
 		return
@@ -212,36 +190,28 @@ func HTTPProxy(client net.Conn, request string) {
 	defer server.Close()
 	go Forward(server, client)
 
+	dataSize := 0
 	data := make([]byte, BUFFER_SIZE)
 	for {
-		if dataSize > -1 {
-			n, _ := client.Read(data[:])
-			if n <= 0 {
-				return
-			}
-			if dataSize > 0 {
-				if n < dataSize {
-					_, err = server.Write(data[:n])
-					dataSize -= n
-					continue
-				} else {
-					_, err = server.Write(data[:dataSize])
-					request = string(data[dataSize:n])
-					dataSize = 0
-				}
-			} else {
-				request += string(data[:n])
-			}
-		}
-
 		method := ""
 		resource := ""
+		field := ""
 		end := strings.Index(request, "\r\n\r\n")
 		if end > 0 {
-			split := strings.Index(request, " ")
-			if split > 0 {
-				split++
-				method = request[:split]
+			resStart := strings.Index(request, " ")
+			if resStart > 0 {
+				resStart++
+				method = request[:resStart]
+				fieldStart := strings.Index(request, "\r\n")
+				if fieldStart > 0 {
+					fieldStart += 2
+					resource = request[resStart+7+hostend : fieldStart]
+				}
+
+				if strings.Index(request, "Host: ") < 0 {
+					resource += resource + "Host: " + host + "\r\n"
+				}
+
 				contentLen := strings.Index(request, "Content-Length: ")
 				if contentLen > 0 {
 					contentLen += 16
@@ -259,29 +229,43 @@ func HTTPProxy(client net.Conn, request string) {
 					dataSize = 0
 				}
 
-				split += 7 + hostend - hoststart
 				end += 4
 
 				if len(request[end:]) < dataSize {
 					dataSize -= len(request[end:])
-					resource = request[split:]
+					field = request[fieldStart:]
 					request = ""
 				} else {
-					resource = request[split : end+dataSize]
+					field = request[fieldStart : end+dataSize]
 					request = request[end+dataSize:]
 					dataSize = 0
 				}
-			} else {
-				continue
+
+				_, err = server.Write([]byte(method + resource + field))
+				if err != nil {
+					log.Println(err)
+					return
+				}
 			}
-		} else {
-			continue
 		}
 
-		_, err = server.Write([]byte(method + resource))
-		if err != nil {
-			log.Println(err)
+		n, _ := client.Read(data[:])
+		if n <= 0 {
 			return
+		}
+
+		if dataSize > 0 {
+			if n < dataSize {
+				_, err = server.Write(data[:n])
+				dataSize -= n
+				continue
+			} else {
+				_, err = server.Write(data[:dataSize])
+				request = string(data[dataSize:n])
+				dataSize = 0
+			}
+		} else {
+			request += string(data[:n])
 		}
 	}
 }

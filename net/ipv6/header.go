@@ -44,14 +44,14 @@ func (h *Header) Marshal() ([]byte, error) {
 	b[0] = byte(Version<<4 | h.TrafficClass>>4)
 	b[1] = byte((h.TrafficClass&0x0f)<<4 | (h.FlowLabel >> 16))
 	binary.BigEndian.PutUint16(b[2:4], uint16(h.FlowLabel&0xffff))
-	binary.BigEndian.PutUint16(b[6:8], uint16(h.PayloadLen))
+	binary.BigEndian.PutUint16(b[4:6], uint16(h.PayloadLen))
 	b[6] = byte(h.NextHeader)
 	b[7] = byte(h.HopLimit)
 	if ip := h.Src.To16(); ip != nil {
-		copy(b[12:16], ip[:net.IPv6len])
+		copy(b[8:24], ip[:net.IPv6len])
 	}
 	if ip := h.Dst.To16(); ip != nil {
-		copy(b[16:20], ip[:net.IPv6len])
+		copy(b[24:40], ip[:net.IPv6len])
 	} else {
 		return nil, errMissingAddress
 	}

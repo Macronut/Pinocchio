@@ -37,12 +37,24 @@ const (
 )
 
 const (
-	UDP   = 0
-	TCP   = 1
-	HTTP  = 2
-	HTTPS = 3
-	DOH   = 4
+	UDP = iota
+	TCP
+	MYTCP
+	HTTP
+	HTTPS
+	DOH
+
+	TYPE_COUNT
 )
+
+var TypeList [TYPE_COUNT]string = [TYPE_COUNT]string{
+	"UDP",
+	"TCP",
+	"MYTCP",
+	"HTTP",
+	"HTTPS",
+	"DOH",
+}
 
 type Question struct {
 	QName  string
@@ -62,13 +74,15 @@ func UnpackHeader(buf []byte) (Header, int) {
 	return header, 12
 }
 
-func UnpackQuestion(buf []byte) (Question, int) {
+func UnpackQuestion(buf []byte) (Question, int, bool) {
+	isdomain := false
 	off := 0
 	n := len(buf)
-	for off < n {
+	for i := 0; off < n; i++ {
 		length := buf[off]
 		off++
 		if length == 0x00 {
+			isdomain = i > 1
 			break
 		}
 		end := off + int(length)
@@ -76,16 +90,17 @@ func UnpackQuestion(buf []byte) (Question, int) {
 	}
 
 	if off+4 > n {
-		return Question{"", 0, 0}, 0
+		return Question{"", 0, 0}, 0, false
 	}
 
+	qname := UnPackQName(buf[:off])
 	question := Question{
-		UnPackQName(buf[:off]),
+		qname,
 		binary.BigEndian.Uint16(buf[off : off+2]),
 		binary.BigEndian.Uint16(buf[off+2 : off+4]),
 	}
 	off += 4
-	return question, off
+	return question, off, isdomain
 }
 
 func PackQName(name string) []byte {
@@ -257,7 +272,7 @@ func BuildLie(ID int, Type uint16) Answers {
 	if Type == TypeA {
 		answer := []byte{0xC0, 0x0C, 0x00, byte(TypeA),
 			0x00, 0x01, 0x00, 0x00, 0x00, 0x10, 0x00, 0x04,
-			100, 64}
+			7, 0}
 		copy(answers[length:], answer)
 		length += 14
 		binary.BigEndian.PutUint16(answers[length:], uint16(ID))
@@ -339,20 +354,54 @@ func PackResponse(header Header, question Question, answers Answers) []byte {
 	return Response[:length]
 }
 
-func HTTPSLookup(qname string, qtype uint16) ([]net.TCPAddr, error) {
+func TCPLookup(request []byte, address string) ([]byte, error) {
+	server, err := net.Dial("tcp", address)
+	if err != nil {
+		return nil, err
+	}
+	defer server.Close()
+	data := make([]byte, 4096)
+	binary.BigEndian.PutUint16(data[:2], uint16(len(request)))
+	copy(data[2:], request)
+
+	_, err = server.Write(data[:len(request)+2])
+	if err != nil {
+		return nil, err
+	}
+
+	length := 0
+	recvlen := 0
+	for {
+		n, err := server.Read(data[length:])
+		if err != nil {
+			return nil, err
+		}
+		if length == 0 {
+			length = int(binary.BigEndian.Uint16(data[:2]) + 2)
+		}
+		recvlen += n
+		if recvlen >= length {
+			return data[2:recvlen], nil
+		}
+	}
+
+	return nil, nil
+}
+
+func HTTPSLookup(qname string, qtype uint16, url string) ([]net.TCPAddr, error) {
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
 	httpsClient := &http.Client{
 		Transport: tr,
 	}
-	var url string
+	url = strings.Replace(url, "[NAME]", qname, 1)
 
 	switch qtype {
 	case TypeA:
-		url = "https://dns.google.com/resolve?name=" + qname
+		url = strings.Replace(url, "[TYPE]", "A", 1)
 	case TypeAAAA:
-		url = "https://dns.google.com/resolve?name=" + qname + "&type=AAAA"
+		url = strings.Replace(url, "[TYPE]", "AAAA", 1)
 	default:
 		return nil, nil
 	}
@@ -386,7 +435,7 @@ func HTTPSLookup(qname string, qtype uint16) ([]net.TCPAddr, error) {
 	//IPList := []net.IP{}
 	IPList := make([]net.TCPAddr, 0)
 	for _, ans := range HTTPAnswer.Answer {
-		if ans.Type == qtype {
+		if ans.Type == TypeA || ans.Type == TypeAAAA {
 			//var ip net.IP = net.ParseIP(ans.Data)
 			IPList = append(IPList, net.TCPAddr{net.ParseIP(ans.Data), ans.TTL, ""})
 		}

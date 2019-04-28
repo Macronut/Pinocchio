@@ -1,14 +1,15 @@
+// +build !windows
+
 package proxy
 
 import (
 	"log"
 	"math/rand"
 	"net"
-
 	"syscall"
 )
 
-func ForceTFOProxyHost(serverAddrList []net.TCPAddr, option string, client net.Conn, host string, port int, mss int) {
+func TFOProxyHost(serverAddrList []AddrInfo, option string, client net.Conn, host string, port int, mss int, headdata []byte) {
 	defer client.Close()
 
 	serverAddrCount := len(serverAddrList)
@@ -19,18 +20,20 @@ func ForceTFOProxyHost(serverAddrList []net.TCPAddr, option string, client net.C
 	var server handle
 	var err error
 
-	data := make([]byte, 1460)
-	n, err := client.Read(data)
-	if err != nil {
-		return
+	addressInfo := serverAddrList[rand.Intn(serverAddrCount)]
+
+	var iface string
+	if len(addressInfo.Interface) == 0 {
+		iface = option
+	} else {
+		iface = addressInfo.Interface
 	}
 
-	if MoveHttps(data[:n], client) {
-		return
-	}
-
-	serverAddr := serverAddrList[rand.Intn(serverAddrCount)]
+	serverAddr := addressInfo.Address
 	IP := serverAddr.IP
+	if serverAddr.Port != 0 {
+		port = serverAddr.Port
+	}
 
 	var sa syscall.Sockaddr
 	ip4 := IP.To4()
@@ -39,34 +42,44 @@ func ForceTFOProxyHost(serverAddrList []net.TCPAddr, option string, client net.C
 		copy(addr[:4], ip4[:4])
 		sa = &syscall.SockaddrInet4{Addr: addr, Port: port}
 		server, err = syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
+		_, err = BindInterface(server, iface)
+		if err != nil {
+			log.Println(err)
+			syscall.Close(server)
+			return
+		}
 	} else {
 		var addr [16]byte
 		copy(addr[:16], IP)
 		sa = &syscall.SockaddrInet6{Addr: addr, Port: port}
 		server, err = syscall.Socket(syscall.AF_INET6, syscall.SOCK_STREAM, 0)
+		_, err = BindInterface6(server, iface)
+		if err != nil {
+			log.Println(err)
+			syscall.Close(server)
+			return
+		}
 	}
-	if err != nil {
-		log.Println(host, err)
-	}
-
-	err = ConnectEx(server, []byte("GET / HTTP/1.1\r\n\r\n"), sa)
-	if err != nil {
-		return
-	}
-	recv := make([]byte, 325)
-	_, err = syscall.Read(server, recv)
-	syscall.Close(server)
-
-	if ip4 != nil {
-		server, err = syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
-	} else {
-		server, err = syscall.Socket(syscall.AF_INET6, syscall.SOCK_STREAM, 0)
-	}
-	defer syscall.Close(server)
 
 	if mss > 0 {
-		if SetTCPMaxSeg(server, mss) != nil {
+		err = SetTCPMaxSeg(server, mss)
+		if err != nil {
 			log.Println(err)
+			syscall.Close(server)
+			return
+		}
+	}
+
+	data := make([]byte, BUFFER_SIZE)
+	n := 0
+	if len(headdata) > 0 {
+		copy(data[:], headdata[:])
+		n = len(headdata)
+	} else {
+		n, err = client.Read(data)
+		if err != nil {
+			log.Println(err)
+			syscall.Close(server)
 			return
 		}
 	}
@@ -74,23 +87,42 @@ func ForceTFOProxyHost(serverAddrList []net.TCPAddr, option string, client net.C
 	err = ConnectEx(server, data[:n], sa)
 	if err != nil {
 		log.Println(host, err)
-		return
-	}
-
-	if SetTCPKeepAlive(server, true) != nil {
-		log.Println(err)
+		syscall.Close(server)
 		return
 	}
 
 	go ForwardFromSocket(server, client)
 
+	if mss > 0 {
+		//Restore MSS
+		n, err = client.Read(data)
+		if n <= 0 {
+			return
+		}
+
+		if mss > 0 {
+			err = SetTCPMaxSeg(server, 1452)
+			if err != nil {
+				log.Println(err)
+				return
+			}
+		}
+		n, err = SendAll(server, data[:n])
+		if err != nil {
+			return
+		}
+	}
+
 	for {
 		n, err := client.Read(data)
 		if n <= 0 {
+			syscall.Close(server)
 			return
 		}
 		n, err = SendAll(server, data[:n])
 		if err != nil {
+			log.Println(host, err)
+			syscall.Close(server)
 			return
 		}
 	}

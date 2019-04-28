@@ -37,21 +37,21 @@ func GetRealHost(client net.Conn) (string, int) {
 	return "", 0
 }
 
-func SocksProxyAddr(serverAddrList []net.TCPAddr, client net.Conn, address *net.TCPAddr) {
+func SocksProxyAddr(serverAddrList []AddrInfo, option string, client net.Conn, address *net.TCPAddr) {
 	addr, err := net.ResolveTCPAddr("tcp", ":0")
-	serverAddr := serverAddrList[rand.Intn(len(serverAddrList))]
-	server, err := net.DialTCP("tcp", addr, &serverAddr)
+
+	var server net.Conn
+	if len(serverAddrList) > 0 {
+		serverAddr := serverAddrList[rand.Intn(len(serverAddrList))].Address
+		server, err = net.DialTCP("tcp", addr, &serverAddr)
+	} else {
+		server, err = net.Dial("tcp", option)
+	}
 	if err != nil {
 		log.Println(err)
 		return
 	}
 	defer server.Close()
-
-	err = server.SetKeepAlive(true)
-	if err != nil {
-		log.Println(err)
-		return
-	}
 
 	var b [1024]byte
 	_, err = server.Write([]byte{0x05, 0x01, 0x00})
@@ -85,7 +85,7 @@ func SocksProxyAddr(serverAddrList []net.TCPAddr, client net.Conn, address *net.
 		}
 		n, err := server.Read(b[:])
 		if err != nil {
-			log.Println(err)
+			log.Println(address, err)
 			return
 		}
 		if n < 2 {
@@ -100,21 +100,21 @@ func SocksProxyAddr(serverAddrList []net.TCPAddr, client net.Conn, address *net.
 	Forward(client, server)
 }
 
-func SocksProxyHost(serverAddrList []net.TCPAddr, client net.Conn, host string, port int) {
+func SocksProxyHost(serverAddrList []AddrInfo, option string, client net.Conn, host string, port int) {
 	addr, err := net.ResolveTCPAddr("tcp", ":0")
-	serverAddr := serverAddrList[rand.Intn(len(serverAddrList))]
-	server, err := net.DialTCP("tcp", addr, &serverAddr)
+
+	var server net.Conn
+	if len(serverAddrList) > 0 {
+		serverAddr := serverAddrList[rand.Intn(len(serverAddrList))].Address
+		server, err = net.DialTCP("tcp", addr, &serverAddr)
+	} else {
+		server, err = net.Dial("tcp", option)
+	}
 	if err != nil {
 		log.Println(err)
 		return
 	}
 	defer server.Close()
-
-	err = server.SetKeepAlive(true)
-	if err != nil {
-		log.Println(err)
-		return
-	}
 
 	var b [1024]byte
 	_, err = server.Write([]byte{0x05, 0x01, 0x00})

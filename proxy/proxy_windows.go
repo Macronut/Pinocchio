@@ -1,32 +1,54 @@
 package proxy
 
 import (
+	"crypto/cipher"
 	"encoding/binary"
 	"log"
 	"math/rand"
 	"net"
+	"strings"
 	"syscall"
 	"unsafe"
 )
 
 const (
-	Direct = iota
+	NULL = iota
 	HTTP
 	HTTPS
 	IPv6to4
-	Socks5
+	SOCKS
 	IPv4to6
 
 	MOVE
-	MOVETFO
 	BIND
-	BINDTFO
-	TTL
-	TTLS
+	MYSTIFY
+	MYSTIFY6
+	MYTCPMD5
+	MYHTTP
+	MYHTTP6
 	TFO
+	STRIP
 
 	TYPE_COUNT
 )
+
+var TypeList [TYPE_COUNT]string = [TYPE_COUNT]string{
+	"NULL",
+	"HTTP",
+	"HTTPS",
+	"IPv6to4",
+	"SOCKS",
+	"IPv4to6",
+	"MOVE",
+	"BIND",
+	"MYSTIFY",
+	"MYSTIFY6",
+	"MYTCPMD5",
+	"MYHTTP",
+	"MYHTTP6",
+	"TFO",
+	"STRIP",
+}
 
 const (
 	TCP_NODELAY              = 0x0001
@@ -50,23 +72,30 @@ const (
 )
 
 const BUFFER_SIZE int = 65536
-
 const SOL_TCP = syscall.IPPROTO_TCP
+
+var LogEnable = false
 
 type handle = syscall.Handle
 
+type AddrInfo struct {
+	Address   net.TCPAddr
+	Interface string
+}
+
 type ProxyInfo struct {
-	Type     uint16
+	Type     uint8
+	TTL      uint8
 	MSS      uint16
-	AddrList []net.TCPAddr
+	AddrList []AddrInfo
 	Option   string
 }
 
-func SendAll(sock handle, data []byte) (int, error) {
+func SendAll(sock net.Conn, data []byte) (int, error) {
 	length := len(data)
 	sended := 0
 	for {
-		n, err := syscall.Write(sock, data[sended:])
+		n, err := sock.Write(data[sended:])
 		if n <= 0 {
 			return n, err
 		}
@@ -125,6 +154,32 @@ func ForwardFromSocket(src handle, dst net.Conn) {
 				return
 			}
 			sended += n
+			if sended == length {
+				break
+			}
+		}
+	}
+}
+
+func CipherForward(server net.Conn, client net.Conn, stream cipher.Stream) {
+	data := make([]byte, BUFFER_SIZE)
+	defer server.Close()
+	for {
+		n, _ := server.Read(data)
+		if n <= 0 {
+			return
+		}
+
+		stream.XORKeyStream(data, data[:n])
+		length := n
+		sended := 0
+		for {
+			n, _ = client.Write(data[sended:length])
+			sended += n
+
+			if n <= 0 {
+				return
+			}
 			if sended == length {
 				break
 			}
@@ -241,23 +296,46 @@ func Proxy(client net.Conn, address string) error {
 	if err != nil {
 		return err
 	}
-	defer server.Close()
 	go Forward(server, client)
 	Forward(client, server)
 
 	return nil
 }
 
-func ProxyTFO(client net.Conn, address string) error {
-	return Proxy(client, address)
+func ProxyTFO(client net.Conn, address string, headData []byte) error {
+	var data [2048]byte
+	var n int
+	var err error
+
+	if len(headData) > 0 {
+		n = len(headData)
+		copy(data[:], headData)
+	} else {
+		n, err = client.Read(data[:])
+		if n <= 0 {
+			return err
+		}
+	}
+
+	server, err := net.Dial("tcp", address)
+	if err != nil {
+		return err
+	}
+
+	server.Write(data[:n])
+
+	go Forward(server, client)
+	Forward(client, server)
+
+	return nil
 }
 
-func ProxyAddress(client net.Conn, serverAddrList []net.TCPAddr, port int) error {
+func ProxyAddress(client net.Conn, serverAddrList []AddrInfo, port int) error {
 	serverAddrCount := len(serverAddrList)
 	if serverAddrCount == 0 {
 		return nil
 	}
-	serverAddr := serverAddrList[rand.Intn(serverAddrCount)]
+	serverAddr := serverAddrList[rand.Intn(serverAddrCount)].Address
 	serverAddr.Port = port
 
 	server, err := net.DialTCP("tcp", nil, &serverAddr)
@@ -270,6 +348,111 @@ func ProxyAddress(client net.Conn, serverAddrList []net.TCPAddr, port int) error
 	Forward(client, server)
 
 	return nil
+}
+
+func ProxyAddressBind(client net.Conn, serverAddrList []AddrInfo, port int, iface string) error {
+	serverAddrCount := len(serverAddrList)
+	if serverAddrCount == 0 {
+		return nil
+	}
+	serverAddr := serverAddrList[rand.Intn(serverAddrCount)].Address
+	serverAddr.Port = port
+
+	ief, err := net.InterfaceByName(iface)
+	if err != nil {
+		return err
+	}
+	addrs, err := ief.Addrs()
+	if err != nil {
+		return err
+	}
+
+	tcpAddr := &net.TCPAddr{
+		IP: addrs[0].(*net.IPNet).IP,
+	}
+
+	server, err := net.DialTCP("tcp", tcpAddr, &serverAddr)
+	if err != nil {
+		return err
+	}
+	defer server.Close()
+
+	go Forward(server, client)
+	Forward(client, server)
+
+	return nil
+}
+
+func MoveHttps(data []byte, client net.Conn) bool {
+	if data[0] == 0x16 {
+		return false
+	}
+	header := string(data)
+	if header[:4] != "GET " {
+		return false
+	}
+	d := make([]byte, 1024)
+	start := strings.Index(header, "Host: ") + 6
+	end := strings.Index(header[start:], "\r\n") + start
+	n := 0
+	copy(d[:], []byte("HTTP/1.1 301 TLS Redirect\r\nLocation: https://"))
+	n += 45
+	copy(d[n:], []byte(header[start:end]))
+	n += end - start
+	start = strings.Index(header, " /") + 1
+	end = strings.Index(header[start:], " ") + start
+	copy(d[n:], []byte(header[start:end]))
+	n += end - start
+	copy(d[n:], []byte("\r\nContent-Length: 0\r\n\r\n"))
+	n += 23
+	client.Write(d[:n])
+	return true
+}
+
+func MoveHttp(header string, host string, client net.Conn) bool {
+	data := make([]byte, BUFFER_SIZE)
+	n := 0
+	if host == "" {
+		if header[:4] != "GET " {
+			return true
+		}
+		copy(data[:], []byte("HTTP/1.1 200 OK"))
+		n += 15
+	} else if host == "https" {
+		if header[:4] != "GET " {
+			return false
+		}
+		copy(data[:], []byte("HTTP/1.1 302 Found\r\nLocation: https://"))
+		n += 38
+
+		start := strings.Index(header, "Host: ") + 6
+		end := strings.Index(header[start:], "\r\n") + start
+		copy(data[n:], []byte(header[start:end]))
+		n += end - start
+
+		start = 4
+		end = strings.Index(header[start:], " ") + start
+		copy(data[n:], []byte(header[start:end]))
+		n += end - start
+	} else {
+		if header[:4] != "GET " {
+			return false
+		}
+		copy(data[:], []byte("HTTP/1.1 302 Found\r\nLocation: "))
+		n += 30
+		copy(data[n:], []byte(host))
+		n += len(host)
+
+		start := 4
+		end := strings.Index(header[start:], " ") + start
+		copy(data[n:], []byte(header[start:end]))
+		n += end - start
+	}
+
+	copy(data[n:], []byte("\r\nCache-Control: private\r\nServer: pinocchio\r\nContent-Length: 0\r\n\r\n"))
+	n += 66
+	client.Write(data[:n])
+	return true
 }
 
 func GetSNI(b []byte) string {
@@ -306,7 +489,7 @@ func GetSNI(b []byte) string {
 			offset++
 			ServerNameLength := binary.BigEndian.Uint16(b[offset : offset+2])
 			offset += 2
-			return string(b[offset:ServerNameLength])
+			return string(b[offset : offset+int(ServerNameLength)])
 		} else {
 			offset += int(ExtensionLength)
 		}
@@ -314,10 +497,70 @@ func GetSNI(b []byte) string {
 	return ""
 }
 
-func TTLProxyHost(serverAddrList []net.TCPAddr, option string, client net.Conn, host string, port int, mss int) {
-	//TODO
+func GetQUICSNI(b []byte) string {
+	if len(b) < 54 {
+		return ""
+	}
+	//CID := string(b[1:9])
+	//Version := string(b[9:13])
+	//PacketNumber := b[13]
+	//AuthHash := b[14:26]
+	FramType := b[26]
+	if FramType == 0xA0 {
+		//StreamID := b[27]
+		//DataLen := binary.LittleEndian.Uint16(b[28:30])
+		Tag := string(b[30:34])
+		if Tag == "CHLO" {
+			TagNumber := binary.LittleEndian.Uint16(b[34:36])
+			//Padding := binary.LittleEndian.Uint16(b[36:38])
+			offset := 38 + TagNumber*8
+			start := offset
+			for i := 0; i < int(TagNumber); i++ {
+				tagStart := 38 + i*8
+				TagName := string(b[tagStart : tagStart+4])
+				end := binary.LittleEndian.Uint16(b[tagStart+4 : tagStart+8])
+				end += offset
+				//fmt.Println("[QUIC]", TagName, end)
+				if TagName == "SNI\x00" {
+					return string(b[start:end])
+				}
+				start = end
+			}
+		}
+	}
+	return ""
 }
 
-func TTLSProxyHost(serverAddrList []net.TCPAddr, option string, client net.Conn, host string, port int, mss int) {
-	//TODO
+func GetHost(b []byte) string {
+	header := string(b)
+	start := strings.Index(header, "Host: ") + 6
+	if start == -1 {
+		return ""
+	}
+	end := strings.Index(header[start:], "\r\n")
+	if end == -1 {
+		return ""
+	}
+	end += start
+	return header[start:end]
+}
+
+func MystifyProxyHTTP(serverAddrList []AddrInfo, option string, client net.Conn, host string, port int, ttl int, mss int) {
+}
+func MystifyProxy6(serverAddrList []AddrInfo, option string, client net.Conn, host string, port int, ttl int, mss int, md5 bool, headdata []byte) {
+}
+func MystifyProxyHTTP6(serverAddrList []AddrInfo, option string, client net.Conn, host string, port int, ttl int, mss int, md5 bool) {
+}
+func ForceTFOProxyHost(serverAddrList []AddrInfo, option string, client net.Conn, host string, port int, mss int, headdata []byte) {
+}
+func MoveProxyHost(serverAddrList []AddrInfo, client net.Conn, host string, port int, mss int, headdata []byte) {
+}
+func BindProxyAddr(serverAddrList []AddrInfo, option string, client net.Conn, address *net.TCPAddr, mss int, tfo bool) {
+}
+func BindProxyHost(serverAddrList []AddrInfo, option string, client net.Conn, host string, port int, mss int, headdata []byte) {
+}
+func TFOProxyHost(serverAddrList []AddrInfo, option string, client net.Conn, host string, port int, mss int, headdata []byte) {
+}
+func MystifyTCPLookup(request []byte, address string, ttl int) ([]byte, error) {
+	return nil, nil
 }

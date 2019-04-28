@@ -78,18 +78,27 @@ func (h *PseudoHeader) Marshal() ([]byte, error) {
 	if h == nil {
 		return nil, syscall.EINVAL
 	}
-	b := make([]byte, 12)
-	if ip := h.Src.To4(); ip != nil {
-		copy(b[0:4], ip[:net.IPv4len])
-	}
-	if ip := h.Dst.To4(); ip != nil {
-		copy(b[4:8], ip[:net.IPv4len])
+
+	ipv4 := h.Src.To4()
+	if ipv4 != nil {
+		b := make([]byte, 12)
+		copy(b[0:4], ipv4[:net.IPv4len])
+		if ip := h.Dst.To4(); ip != nil {
+			copy(b[4:8], ip[:net.IPv4len])
+		} else {
+			return nil, errMissingAddress
+		}
+		binary.BigEndian.PutUint16(b[8:10], h.Protocol)
+		binary.BigEndian.PutUint16(b[10:12], h.Len)
+		return b, nil
 	} else {
-		return nil, errMissingAddress
+		b := make([]byte, 40)
+		copy(b[0:16], h.Src[:net.IPv6len])
+		copy(b[16:32], h.Dst[:net.IPv6len])
+		binary.BigEndian.PutUint16(b[34:36], h.Len)
+		binary.BigEndian.PutUint16(b[38:40], h.Protocol)
+		return b, nil
 	}
-	binary.BigEndian.PutUint16(b[8:10], h.Protocol)
-	binary.BigEndian.PutUint16(b[10:12], h.Len)
-	return b, nil
 }
 
 func CheckSum(data []byte) uint16 {
@@ -115,24 +124,46 @@ func (h *Header) MarshalWithData(ipheader []byte, data []byte) ([]byte, error) {
 	if h == nil {
 		return nil, syscall.EINVAL
 	}
-	hdrlen := 12 + HeaderLen + len(h.Options)
-	b := make([]byte, hdrlen+len(data))
-	copy(b[:12], ipheader)
-	binary.BigEndian.PutUint16(b[12:14], h.SPort)
-	binary.BigEndian.PutUint16(b[14:16], h.DPort)
-	binary.BigEndian.PutUint32(b[16:20], h.SeqNum)
-	binary.BigEndian.PutUint32(b[20:24], h.AckNum)
-	b[24] = byte(int(h.Offset<<4) | int(h.Flags>>8))
-	b[25] = byte(h.Flags & 0xff)
-	binary.BigEndian.PutUint16(b[26:28], h.WinSize)
-	binary.BigEndian.PutUint16(b[28:30], 0)
-	binary.BigEndian.PutUint16(b[30:32], h.UrgPointer)
-	if len(h.Options) > 0 {
-		copy(b[12+HeaderLen:], h.Options)
+
+	if len(ipheader) == 12 {
+		hdrlen := 12 + HeaderLen + len(h.Options)
+		b := make([]byte, hdrlen+len(data))
+		copy(b[:12], ipheader)
+		binary.BigEndian.PutUint16(b[12:14], h.SPort)
+		binary.BigEndian.PutUint16(b[14:16], h.DPort)
+		binary.BigEndian.PutUint32(b[16:20], h.SeqNum)
+		binary.BigEndian.PutUint32(b[20:24], h.AckNum)
+		b[24] = byte(int(h.Offset<<4) | int(h.Flags>>8))
+		b[25] = byte(h.Flags & 0xff)
+		binary.BigEndian.PutUint16(b[26:28], h.WinSize)
+		binary.BigEndian.PutUint16(b[28:30], 0)
+		binary.BigEndian.PutUint16(b[30:32], h.UrgPointer)
+		if len(h.Options) > 0 {
+			copy(b[12+HeaderLen:], h.Options)
+		}
+		copy(b[hdrlen:], data)
+		binary.BigEndian.PutUint16(b[28:30], CheckSum(b))
+		return b[12:], nil
+	} else {
+		hdrlen := 40 + HeaderLen + len(h.Options)
+		b := make([]byte, hdrlen+len(data))
+		copy(b[:40], ipheader)
+		binary.BigEndian.PutUint16(b[40:42], h.SPort)
+		binary.BigEndian.PutUint16(b[42:44], h.DPort)
+		binary.BigEndian.PutUint32(b[44:48], h.SeqNum)
+		binary.BigEndian.PutUint32(b[48:52], h.AckNum)
+		b[52] = byte(int(h.Offset<<4) | int(h.Flags>>8))
+		b[53] = byte(h.Flags & 0xff)
+		binary.BigEndian.PutUint16(b[54:56], h.WinSize)
+		binary.BigEndian.PutUint16(b[56:58], 0)
+		binary.BigEndian.PutUint16(b[58:60], h.UrgPointer)
+		if len(h.Options) > 0 {
+			copy(b[40+HeaderLen:], h.Options)
+		}
+		copy(b[hdrlen:], data)
+		binary.BigEndian.PutUint16(b[56:58], CheckSum(b))
+		return b[40:], nil
 	}
-	copy(b[hdrlen:], data)
-	binary.BigEndian.PutUint16(b[28:30], CheckSum(b))
-	return b[12:], nil
 }
 
 // Parse parses b as an IPv4 header and sotres the result in h.
