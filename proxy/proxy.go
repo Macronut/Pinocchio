@@ -49,12 +49,6 @@ var TypeList [TYPE_COUNT]string = [TYPE_COUNT]string{
 	"MYHTTP6",
 	"TFO",
 	"STRIP",
-	"CRYPTO",
-	"CRYPTO_TFO",
-	"CRYPTO_SNI",
-	"CRYPTO_SNITFO",
-	"KCP",
-	"KCPMUX",
 }
 
 const BUFFER_SIZE int = 65536
