@@ -4,13 +4,12 @@ import (
 	"bytes"
 	"strconv"
 
-	//"encoding/binary"
+	"encoding/binary"
 	"log"
 	"math/rand"
 	"net"
 
-	//"strings"
-	//"syscall"
+	"strings"
 	//"time"
 
 	//"../net/ipv4"
@@ -139,47 +138,49 @@ func MystifySend(conn *net.TCPConn, data []byte, addr *net.TCPAddr, ttl int, hos
 	}
 
 	hostOffset := 0
-	off := 0
-	for i := 0; i < len(data); i++ {
-		if data[i] == hostbyte[off] {
-			off++
-			if off == len(hostbyte) {
-				hostOffset = i
-				break
+	if host != "" {
+		off := 0
+		for i := 0; i < len(data); i++ {
+			if data[i] == hostbyte[off] {
+				off++
+				if off == len(hostbyte) {
+					hostOffset = i
+					break
+				}
+			} else {
+				off = 0
 			}
-		} else {
-			off = 0
 		}
-	}
-	if hostOffset > 0 {
-		hostOffset -= len(hostbyte) / 2
-		_, err = conn.Write(data[:hostOffset])
-		if err != nil {
-			return err
+		if hostOffset > 0 {
+			hostOffset -= len(hostbyte) / 2
+			_, err = conn.Write(data[:hostOffset])
+			if err != nil {
+				return err
+			}
+
+			packet, err := winDivert.Recv()
+			if err != nil {
+				return err
+			}
+
+			fake_packet := *packet
+			copy(rawbuf[:], packet.Raw[:len(packet.Raw)-hostOffset])
+			rawbuf[8] = byte(ttl)
+			fake_packet.Raw = rawbuf[:len(packet.Raw)]
+			fake_packet.CalcNewChecksum(winDivert)
+
+			_, err = winDivert.Send(&fake_packet)
+			if err != nil {
+				log.Println(host, err)
+				return err
+			}
+
+			_, err = winDivert.Send(packet)
+			if err != nil {
+				log.Println(host, err)
+				return err
+			}
 		}
-	}
-
-	packet, err := winDivert.Recv()
-	if err != nil {
-		return err
-	}
-
-	fake_packet := *packet
-	copy(rawbuf[:], packet.Raw[:len(packet.Raw)-hostOffset])
-	rawbuf[8] = byte(ttl)
-	fake_packet.Raw = rawbuf[:len(packet.Raw)]
-	fake_packet.CalcNewChecksum(winDivert)
-
-	_, err = winDivert.Send(&fake_packet)
-	if err != nil {
-		log.Println(host, err)
-		return err
-	}
-
-	_, err = winDivert.Send(packet)
-	if err != nil {
-		log.Println(host, err)
-		return err
 	}
 
 	_, err = conn.Write(data[hostOffset:])
@@ -188,11 +189,11 @@ func MystifySend(conn *net.TCPConn, data []byte, addr *net.TCPAddr, ttl int, hos
 		return err
 	}
 
-	packet, err = winDivert.Recv()
+	packet, err := winDivert.Recv()
 	if err != nil {
 		return err
 	}
-	fake_packet = *packet
+	fake_packet := *packet
 	copy(rawbuf[:], packet.Raw[:len(packet.Raw)-len(data)+hostOffset])
 	rawbuf[8] = byte(ttl)
 	fake_packet.Raw = rawbuf[:len(packet.Raw)]
@@ -326,4 +327,89 @@ func MystifyProxy(serverAddrList []AddrInfo, option string, client net.Conn, hos
 			return
 		}
 	}
+}
+
+func MystifyProxyHTTP(serverAddrList []AddrInfo, option string, client net.Conn, host string, port int, ttl int, mss int) {
+	defer client.Close()
+
+	serverAddrCount := len(serverAddrList)
+	if serverAddrCount == 0 {
+		return
+	}
+
+	var err error
+
+	addressInfo := serverAddrList[rand.Intn(serverAddrCount)]
+	serverAddr := addressInfo.Address
+
+	server, err := net.DialTCP("tcp4", nil, &serverAddr)
+	if err != nil {
+		log.Println(host, err)
+		return
+	}
+	defer server.Close()
+
+	go Forward(server, client)
+
+	data := make([]byte, 1460)
+	for {
+		n, err := client.Read(data)
+		if err != nil {
+			return
+		}
+
+		requestValue := strings.Split(string(data[:n]), "\r\n")
+		request := ""
+		for _, value := range requestValue {
+			if strings.HasPrefix(value, "Referer: ") {
+				continue
+			} else if strings.HasPrefix(value, "Cookie: ") {
+				continue
+			}
+
+			request += string(value) + "\r\n"
+		}
+
+		err = MystifySend(server, []byte(request), &serverAddr, ttl, host)
+		if err != nil {
+			return
+		}
+	}
+}
+
+func MystifyTCPLookup(request []byte, address string, ttl int) ([]byte, error) {
+	serverAddr, err := net.ResolveTCPAddr("tcp", address)
+	if err != nil {
+		return nil, err
+	}
+
+	server, err := net.DialTCP("tcp", nil, serverAddr)
+	defer server.Close()
+
+	data := make([]byte, 4096)
+	binary.BigEndian.PutUint16(data[:2], uint16(len(request)))
+	copy(data[2:], request)
+
+	err = MystifySend(server, data[:len(request)+2], serverAddr, ttl, "")
+	if err != nil {
+		return nil, err
+	}
+
+	length := 0
+	recvlen := 0
+	for {
+		n, err := server.Read(data[length:])
+		if err != nil {
+			return nil, err
+		}
+		if length == 0 {
+			length = int(binary.BigEndian.Uint16(data[:2]) + 2)
+		}
+		recvlen += n
+		if recvlen >= length {
+			return data[2:recvlen], nil
+		}
+	}
+
+	return nil, nil
 }
