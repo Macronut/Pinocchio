@@ -545,8 +545,6 @@ func GetHost(b []byte) string {
 	return header[start:end]
 }
 
-func MystifyProxyHTTP(serverAddrList []AddrInfo, option string, client net.Conn, host string, port int, ttl int, mss int) {
-}
 func MystifyProxy6(serverAddrList []AddrInfo, option string, client net.Conn, host string, port int, ttl int, mss int, md5 bool, headdata []byte) {
 }
 func MystifyProxyHTTP6(serverAddrList []AddrInfo, option string, client net.Conn, host string, port int, ttl int, mss int, md5 bool) {
@@ -560,7 +558,4 @@ func BindProxyAddr(serverAddrList []AddrInfo, option string, client net.Conn, ad
 func BindProxyHost(serverAddrList []AddrInfo, option string, client net.Conn, host string, port int, mss int, headdata []byte) {
 }
 func TFOProxyHost(serverAddrList []AddrInfo, option string, client net.Conn, host string, port int, mss int, headdata []byte) {
-}
-func MystifyTCPLookup(request []byte, address string, ttl int) ([]byte, error) {
-	return nil, nil
 }
