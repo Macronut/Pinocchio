@@ -460,11 +460,13 @@ func main() {
 	fmt.Println(Args)
 
 	argcount := len(Args)
+
+	//Config
+	service.CacheMap = make(map[string]service.DNSCache)
+	service.ProxyMap = make(map[uint64]*proxy.ProxyInfo)
+	service.ProxyClients = make(map[string]bool)
+
 	if argcount > 1 {
-		//Config
-		service.CacheMap = make(map[string]service.DNSCache)
-		service.ProxyMap = make(map[uint64]*proxy.ProxyInfo)
-		service.ProxyClients = make(map[string]bool)
 
 		for _, arg := range Args[:] {
 			if arg == "-4" {
@@ -484,8 +486,15 @@ func main() {
 			}
 		}
 	} else {
-		fmt.Println("-4 IPv4\r\n-6 IPv6\r\n-r Random DNS Port\r\n")
-		return
+		//fmt.Println("-4 IPv4\r\n-6 IPv6\r\n-r Random DNS Port\r\n")
+		//return
+
+		service.DNSMode = 4
+		err := handleLoadConfigFile("pino.conf")
+		if err != nil {
+			log.Println(err)
+			return
+		}
 	}
 
 	if DNSPort != 0 {
@@ -526,7 +535,7 @@ func main() {
 			}
 		}
 	} else {
-		addr, err := net.ResolveUDPAddr("udp", "127.0.0.1:5353")
+		addr, err := net.ResolveUDPAddr("udp", "127.0.0.1:53")
 		err = service.PinocchioDNS(*addr)
 		if err != nil {
 			log.Println(err)
