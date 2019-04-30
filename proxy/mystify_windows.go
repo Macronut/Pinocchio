@@ -2,18 +2,14 @@ package proxy
 
 import (
 	"bytes"
-	"strconv"
-
 	"encoding/binary"
 	"log"
 	"math/rand"
 	"net"
-
+	"strconv"
 	"strings"
-	//"time"
+	"sync"
 
-	//"../net/ipv4"
-	//"../net/tcp"
 	"github.com/williamfhe/godivert"
 )
 
@@ -21,90 +17,90 @@ func htons(h uint16) uint16 {
 	return ((h >> 8) & 0xFF) | ((h & 0xFF) << 8)
 }
 
-/*
-func MystifyConnect(raddr, laddr *net.TCPAddr, timeout int) (*net.TCPConn, TCPInfo, error) {
-	var connInfo = TCPInfo{0, 0, 0, 0, 0}
+var MystifyMSSMutex sync.Mutex
+var MSSDaemonEnable = false
+var MystifyMSSMap map[string]uint16
 
-	winDivert, err := godivert.NewWinDivertHandle("tcp.Syn and tcp.SrcPort == 443")
+func MystifyMSSDaemon() {
+	filter := "tcp.Syn and tcp.DstPort == 443"
+	winDivert, err := godivert.NewWinDivertHandle(filter)
 	if err != nil {
-		log.Println(err)
-		return nil, connInfo, err
+		log.Println(err, filter)
+		return
 	}
 	defer winDivert.Close()
 
-	conn, err := net.DialTCP("tcp4", laddr, raddr)
-	if err != nil {
-		log.Println(err)
-		return nil, connInfo, err
-	}
+	for {
+		packet, err := winDivert.Recv()
+		if err != nil {
+			log.Println(err)
+			return
+		}
 
-	ch := make(chan TCPInfo)
-	LocalAddr := conn.LocalAddr()
-	LocalTCPAddr, err := net.ResolveTCPAddr(LocalAddr.Network(), LocalAddr.String())
-	iSockIP := binary.BigEndian.Uint32(LocalTCPAddr.IP[:4])
-	sockPort := uint16(LocalTCPAddr.Port)
-	PortChan[sockPort] = ch
-	defer func() {
-		PortChan[sockPort] = nil
-	}()
-
-	go func() {
-		for {
-			var ipheader ipv4.Header
-			var tcpheader tcp.Header
-
-			packet, err := winDivert.Recv()
-			if err != nil {
-				return
-			}
-			if packet.PacketLen < 40 {
-				continue
-			}
-
-			log.Println(packet)
-
-			err = ipheader.Parse(packet.Raw)
-			if err != nil {
-				log.Println(err)
-				continue
-			}
-
-			iDstIP := binary.BigEndian.Uint32(ipheader.Dst.To4())
-			if iDstIP != iSockIP {
-				continue
-			}
-
-			err = tcpheader.Parse(packet.Raw[ipheader.Len:])
-			if err != nil {
-				log.Println(err)
-				continue
-			}
-
-			if tcpheader.Flags != tcp.FlagSYN|tcp.FlagACK {
-				continue
-			}
-
-			if tcpheader.DPort == sockPort {
-				ch <- TCPInfo{iSockIP, sockPort, uint16(ipheader.TTL), tcpheader.AckNum, tcpheader.SeqNum + 1}
-				break
-			} else {
-				pch := PortChan[tcpheader.DPort]
-				if pch != nil {
-					pch <- TCPInfo{iDstIP, tcpheader.DPort, uint16(ipheader.TTL), tcpheader.AckNum, tcpheader.SeqNum + 1}
+		ipheadlen := int(packet.Raw[0]&0xF) * 4
+		if len(packet.Raw) >= ipheadlen+24 {
+			MystifyMSSMutex.Lock()
+			mss, ok := MystifyMSSMap[packet.DstIP().String()]
+			MystifyMSSMutex.Unlock()
+			if ok {
+				option := packet.Raw[ipheadlen+20]
+				if option == 2 {
+					binary.BigEndian.PutUint16(packet.Raw[ipheadlen+22:], uint16(mss))
+					packet.CalcNewChecksum(winDivert)
 				}
 			}
 		}
-	}()
-	select {
-	case res := <-ch:
-		connInfo = res
-	case <-time.After(time.Second * time.Duration(timeout)):
-		return nil, connInfo, syscall.ETIMEDOUT
+
+		_, err = winDivert.Send(packet)
+		if err != nil {
+			log.Println(err)
+			continue
+		}
+	}
+}
+
+func MystifyConnect(laddr, raddr *net.TCPAddr, mss uint16) (*net.TCPConn, error) {
+	host := raddr.IP.String()
+	filter := "ip.DstAddr == " + host + " and tcp.Syn and tcp.DstPort == " + strconv.Itoa(raddr.Port)
+	winDivert, err := godivert.NewWinDivertHandle(filter)
+	if err != nil {
+		log.Println(err, filter)
+		return nil, err
 	}
 
-	return conn, connInfo, nil
+	go func() {
+		defer winDivert.Close()
+
+		packet, err := winDivert.Recv()
+		if err != nil {
+			log.Println(err)
+			return
+		}
+
+		ipheadlen := int(packet.Raw[0]&0xF) * 4
+		if len(packet.Raw) < ipheadlen+24 {
+			log.Println(packet)
+			return
+		}
+		//offset := packet.Raw[ipheadlen+12] >> 4
+		option := packet.Raw[ipheadlen+20]
+		if option == 2 {
+			binary.BigEndian.PutUint16(packet.Raw[ipheadlen+22:], mss)
+			packet.CalcNewChecksum(winDivert)
+
+			_, err = winDivert.Send(packet)
+			_, err = winDivert.Send(packet)
+			if err != nil {
+				log.Println(err)
+				return
+			}
+		}
+	}()
+
+	conn, err := net.DialTCP("tcp4", laddr, raddr)
+	return conn, err
 }
-*/
+
 const letterBytes = "0123456789abcdefghijklmnopqrstuvwxyz"
 
 func RandStringBytes(n int) []byte {
@@ -193,6 +189,7 @@ func MystifySend(conn *net.TCPConn, data []byte, addr *net.TCPAddr, ttl int, hos
 	if err != nil {
 		return err
 	}
+
 	fake_packet := *packet
 	copy(rawbuf[:], packet.Raw[:len(packet.Raw)-len(data)+hostOffset])
 	rawbuf[8] = byte(ttl)
@@ -263,8 +260,19 @@ func MystifyProxy(serverAddrList []AddrInfo, option string, client net.Conn, hos
 		}
 	*/
 
-	//server, connInfo, err := MystifyConnect(&serverAddr, nil, 6)
-	server, err := net.DialTCP("tcp4", nil, &serverAddr)
+	var server *net.TCPConn
+	if mss > 0 {
+		MystifyMSSMutex.Lock()
+		if MSSDaemonEnable == false {
+			MSSDaemonEnable = true
+			MystifyMSSMap = make(map[string]uint16)
+			go MystifyMSSDaemon()
+		}
+		MystifyMSSMap[serverAddr.IP.String()] = uint16(mss)
+		MystifyMSSMutex.Unlock()
+	}
+
+	server, err = net.DialTCP("tcp4", nil, &serverAddr)
 	if err != nil {
 		log.Println(host, err)
 		return
