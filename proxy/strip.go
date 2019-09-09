@@ -5,6 +5,7 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"time"
 	//"strings"
 )
 
@@ -82,9 +83,15 @@ func StripHost(serverAddrList []AddrInfo, fronting string, client net.Conn, host
 
 	for {
 		n, err := server.Read(data)
+		if LogEnable && err != nil {
+			log.Println(n, err)
+		}
 		if n <= 0 {
 			return
 		}
+
+		client.SetReadDeadline(time.Now().Add(CONN_TTL))
+
 		n, err = client.Write(data[:n])
 		if err != nil {
 			log.Println(err)

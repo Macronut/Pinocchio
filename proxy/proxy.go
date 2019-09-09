@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -27,8 +28,13 @@ const (
 	MYTCPMD5
 	MYHTTP
 	MYHTTP6
+	MYPROXY
+	MYSOCKS
+	MYSOCKS4
+	MYSOCKS4A
 	TFO
 	STRIP
+	WEB
 
 	TYPE_COUNT
 )
@@ -47,12 +53,21 @@ var TypeList [TYPE_COUNT]string = [TYPE_COUNT]string{
 	"MYTCPMD5",
 	"MYHTTP",
 	"MYHTTP6",
+	"MYPROXY",
+	"MYSOCKS",
+	"MYSOCKS4",
+	"MYSOCKS4A",
 	"TFO",
 	"STRIP",
+	"WEB",
 }
 
 const BUFFER_SIZE int = 65536
+const CONN_TTL time.Duration = time.Second * 60
 const SOL_TCP = syscall.SOL_TCP
+
+var ProxyHostMap map[string][]net.TCPAddr
+var HostMapMutex sync.Mutex
 
 var LogEnable = false
 
@@ -96,6 +111,9 @@ func Forward(src net.Conn, dst net.Conn) {
 		if n <= 0 {
 			return
 		}
+
+		src.SetReadDeadline(time.Now().Add(CONN_TTL))
+
 		length := n
 		sended := 0
 		for {
@@ -120,6 +138,9 @@ func ForwardFromSocket(src int, dst net.Conn) {
 			dst.Close()
 			return
 		}
+
+		dst.SetReadDeadline(time.Now().Add(CONN_TTL))
+
 		length := n
 		sended := 0
 		for {

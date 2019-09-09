@@ -6,6 +6,7 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"strings"
 	"syscall"
 )
 
@@ -87,4 +88,46 @@ func MoveProxyHost(serverAddrList []AddrInfo, client net.Conn, host string, port
 			return
 		}
 	}
+}
+
+func WebProxyHost(client net.Conn, host string, option string, headdata []byte) {
+	defer client.Close()
+	var err error
+
+	data := make([]byte, BUFFER_SIZE)
+	n := 0
+	if len(headdata) > 0 {
+		copy(data[:], headdata[:])
+		n = len(headdata)
+	} else {
+		n, err = client.Read(data)
+		if err != nil {
+			log.Println(err)
+			return
+		}
+	}
+
+	header := string(data[:n])
+	if header[:4] != "GET " {
+		return
+	}
+	copy(data[:], []byte("HTTP/1.1 302 Found\r\nLocation: "))
+	n = 30
+	copy(data[n:], []byte(option))
+	n += len(option)
+
+	copy(data[n:], []byte("http://"))
+	n += 7
+	copy(data[n:], []byte(host))
+	n += len(host)
+
+	start := 4
+	end := strings.Index(header[start:], " ") + start
+	copy(data[n:], []byte(header[start:end]))
+	n += end - start
+
+	copy(data[n:], []byte("\r\nCache-Control: private\r\nServer: pinocchio\r\nContent-Length: 0\r\n\r\n"))
+	n += 66
+	client.Write(data[:n])
+	return
 }

@@ -170,11 +170,13 @@ func UnPackAnswers(answers []byte, count int) []net.TCPAddr {
 		offset += 2
 
 		if AType == TypeA {
-			data := answers[offset : offset+4]
+			data := make([]byte, 4)
+			copy(data, answers[offset:offset+4])
 			TCPAddr := &net.TCPAddr{data, int(ttl), ""}
 			IPList = append(IPList, *TCPAddr)
 		} else if AType == TypeAAAA {
-			data := answers[offset : offset+16]
+			data := make([]byte, 16)
+			copy(data, answers[offset:offset+16])
 			TCPAddr := &net.TCPAddr{data, int(ttl), ""}
 			IPList = append(IPList, *TCPAddr)
 		}

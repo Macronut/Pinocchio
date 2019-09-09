@@ -92,6 +92,11 @@ func SocksProxyAddr(serverAddrList []AddrInfo, option string, client net.Conn, a
 			return
 		}
 		if b[0] != 0x05 {
+			log.Println("VER:", b[0])
+			return
+		}
+		if b[1] != 0x00 {
+			log.Println("REP:", b[1])
 			return
 		}
 	}
@@ -147,7 +152,12 @@ func SocksProxyHost(serverAddrList []AddrInfo, option string, client net.Conn, h
 		if n < 2 {
 			return
 		}
-		if b[0] == 0x00 {
+		if b[0] != 0x05 {
+			log.Println("VER:", b[0])
+			return
+		}
+		if b[1] != 0x00 {
+			log.Println("REP:", b[1])
 			return
 		}
 	}

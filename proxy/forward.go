@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"log"
+	"time"
+
 	//"math/rand"
 	"net"
 	//"syscall"
@@ -22,10 +24,15 @@ func ForwardProxyHost(serverAddr *net.TCPAddr, client net.Conn, host string, por
 
 	for {
 		n, err := client.Read(data)
-		if err != nil {
-			log.Println(err)
+		if LogEnable && err != nil {
+			log.Println(n, err)
+		}
+		if n <= 0 {
 			return
 		}
+
+		client.SetReadDeadline(time.Now().Add(CONN_TTL))
+
 		if n == 0 {
 			return
 		}

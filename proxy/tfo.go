@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"net"
 	"syscall"
+	"time"
 )
 
 func TFOProxyHost(serverAddrList []AddrInfo, option string, client net.Conn, host string, port int, mss int, headdata []byte) {
@@ -115,10 +116,17 @@ func TFOProxyHost(serverAddrList []AddrInfo, option string, client net.Conn, hos
 
 	for {
 		n, err := client.Read(data)
+		if LogEnable && err != nil {
+			log.Println(n, err)
+		}
+
 		if n <= 0 {
 			syscall.Close(server)
 			return
 		}
+
+		client.SetReadDeadline(time.Now().Add(CONN_TTL))
+
 		n, err = SendAll(server, data[:n])
 		if err != nil {
 			log.Println(host, err)

@@ -8,6 +8,7 @@ import (
 	"net"
 	"strings"
 	"syscall"
+	"time"
 )
 
 const TCP_USER_TIMEOUT = 0x12
@@ -74,6 +75,12 @@ func BindProxyAddr(serverAddrList []AddrInfo, option string, client net.Conn, ad
 	} else {
 		var addr [16]byte
 		copy(addr[:16], IP)
+		if (addr[12] & addr[13] & addr[14] & addr[15]) == 0 {
+			ip4 := address.IP.To4()
+			if ip4 != nil {
+				copy(addr[12:], ip4)
+			}
+		}
 		sa = &syscall.SockaddrInet6{Addr: addr, Port: port}
 		server, err = syscall.Socket(syscall.AF_INET6, syscall.SOCK_STREAM, 0)
 		_, err = BindInterface6(server, iface)
@@ -97,19 +104,14 @@ func BindProxyAddr(serverAddrList []AddrInfo, option string, client net.Conn, ad
 		err = Connect(server, sa)
 	}
 	if err != nil {
-		log.Println(err)
-		return
-	}
-
-	if err != nil {
-		log.Println(err)
+		log.Println(address, err)
 		return
 	}
 
 	if !tfo {
 		n, err = syscall.Write(server, data[:n])
 		if err != nil {
-			log.Println(err)
+			log.Println(address, err)
 			return
 		}
 	}
@@ -118,9 +120,15 @@ func BindProxyAddr(serverAddrList []AddrInfo, option string, client net.Conn, ad
 
 	for {
 		n, err := client.Read(data)
+		if LogEnable && err != nil {
+			log.Println(n, err)
+		}
 		if n <= 0 {
 			return
 		}
+
+		client.SetReadDeadline(time.Now().Add(CONN_TTL))
+
 		n, err = SendAll(server, data[:n])
 		if err != nil {
 			log.Println(err)
@@ -190,7 +198,7 @@ func BindProxyHost(serverAddrList []AddrInfo, option string, client net.Conn, ho
 
 	err = Connect(server, sa)
 	if err != nil {
-		log.Println(host, err)
+		log.Println(host, port, err)
 		return
 	}
 
@@ -224,9 +232,15 @@ func BindProxyHost(serverAddrList []AddrInfo, option string, client net.Conn, ho
 
 	for {
 		n, err := client.Read(data)
+		if LogEnable && err != nil {
+			log.Println(n, err)
+		}
 		if n <= 0 {
 			return
 		}
+
+		client.SetReadDeadline(time.Now().Add(CONN_TTL))
+
 		n, err = SendAll(server, data[:n])
 		if err != nil {
 			log.Println(host, err)

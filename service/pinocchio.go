@@ -47,6 +47,7 @@ var ProxyMap map[uint64]*proxy.ProxyInfo
 var DefaultServer DNSCache
 var ProxyClients map[string]bool
 var DefaultFakeTTL uint8 = 0
+var DefaultFakeAnswer dns.Answers = dns.NoAnswer
 var DefaultProxy *proxy.ProxyInfo = nil
 var Nose []DNSTruth = []DNSTruth{DNSTruth{"pinocchio", nil}}
 var DNSMode int = 0
@@ -791,8 +792,13 @@ func handleDNSServer(client *net.UDPConn, randport bool) {
 		}
 
 		if cache.Proxy != nil {
-			answers = AddLie(question, cache)
-			response := dns.QuickResponse(data[:n], *answers)
+			var response []byte
+			if DefaultFakeAnswer.Answers == nil {
+				answers = AddLie(question, cache)
+				response = dns.QuickResponse(data[:n], *answers)
+			} else {
+				response = dns.QuickResponse(data[:n], DefaultFakeAnswer)
+			}
 			client.WriteToUDP(response, clientAddr)
 		} else if cache.Server != nil {
 			if LogEnable {
@@ -844,7 +850,109 @@ func handleDNSServer(client *net.UDPConn, randport bool) {
 	}
 }
 
+func handleDNSoverTCP(client *net.TCPConn) {
+	defer client.Close()
+	data := make([]byte, 512)
+
+	n, err := client.Read(data)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+	Now := time.Now()
+	if n < 12 {
+		return
+	}
+	length := int(binary.BigEndian.Uint16(data[:2]))
+	if n-length != 2 {
+		log.Println("Invalid DNS Length")
+		return
+	}
+	header, off := dns.UnpackHeader(data[2:n])
+	off += 2
+	if header.QDCount == 0 {
+		return
+	}
+	question, off, isdomain := dns.UnpackQuestion(data[off:n])
+
+	if off == 0 {
+		log.Println(question.QName, "ERROR")
+		return
+	}
+
+	cache := CacheLookup(question.QName)
+
+	var answers *dns.Answers = nil
+	if question.QType == dns.TypeA {
+		answers = cache.A
+	} else if question.QType == dns.TypeAAAA {
+		answers = cache.AAAA
+	}
+
+	if answers != nil {
+		response := dns.QuickResponse(data[2:n], *answers)
+		n = len(response)
+		binary.BigEndian.PutUint16(data[:2], uint16(n))
+		copy(data[2:], response)
+		n += 2
+		client.Write(data[:n])
+	}
+
+	if DomainNeeded {
+		if isdomain {
+			if strings.HasSuffix(question.QName, ".arpa") {
+				return
+			}
+		} else {
+			return
+		}
+	}
+
+	if cache.Proxy != nil {
+		answers = AddLie(question, cache)
+		response := dns.QuickResponse(data[2:n], *answers)
+		n = len(response)
+		binary.BigEndian.PutUint16(data[:2], uint16(n))
+		copy(data[2:], response)
+		n += 2
+		client.Write(data[:n])
+	} else if cache.Server != nil {
+		if LogEnable {
+			fmt.Println("DNS", question.QName, question.QType, dns.TypeList[(*cache.Server).Type], time.Since(Now))
+		}
+
+		switch (*cache.Server).Type {
+		case dns.UDP:
+			fallthrough
+		case dns.TCP:
+			fallthrough
+		case dns.MYTCP:
+			fallthrough
+		case dns.HTTPS:
+			fallthrough
+		case dns.DOH:
+			fallthrough
+		default:
+			addrlist := NSLookup(question.QName, question.QType, &cache)
+			answers := dns.PackAnswersTTL(addrlist)
+			response := dns.QuickResponse(data[2:n], answers)
+			n = len(response)
+			binary.BigEndian.PutUint16(data[:2], uint16(n))
+			copy(data[2:], response)
+			n += 2
+			client.Write(data[:n])
+		}
+	}
+}
+
 func handleProxyHost(client *net.TCPConn, Proxy *proxy.ProxyInfo, host string, port int, headData []byte) {
+	err := client.SetReadDeadline(time.Now().Add(proxy.CONN_TTL))
+	if err != nil {
+		log.Println(err)
+	}
+	defer client.Close()
+
 	if Proxy == nil {
 		if len(headData) > 0 {
 			proxy.ProxyTFO(client, net.JoinHostPort(host, strconv.Itoa(port)), headData)
@@ -914,22 +1022,44 @@ func handleProxyHost(client *net.TCPConn, Proxy *proxy.ProxyInfo, host string, p
 			proxy.MystifyProxy6(Proxy.AddrList, Proxy.Option,
 				client, host, port, int(Proxy.TTL), int(Proxy.MSS), true, headData)
 		case proxy.MYHTTP:
-			proxy.MystifyProxyHTTP(Proxy.AddrList, Proxy.Option,
+			proxy.MystifyHTTP(Proxy.AddrList, Proxy.Option,
 				client, host, port, int(Proxy.TTL), int(Proxy.MSS))
 		case proxy.MYHTTP6:
 			proxy.MystifyProxyHTTP6(Proxy.AddrList, Proxy.Option,
 				client, host, port, int(Proxy.TTL), int(Proxy.MSS), false)
+		case proxy.MYPROXY:
+			proxy.MystifyHTTPProxy(Proxy.AddrList, Proxy.Option,
+				client, host, port, int(Proxy.TTL), int(Proxy.MSS), headData)
+		case proxy.MYSOCKS:
+			proxy.MystifySocksProxy(Proxy.AddrList, Proxy.Option,
+				client, host, port, int(Proxy.TTL), int(Proxy.MSS), headData)
+		case proxy.MYSOCKS4:
+			proxy.MystifySocks4Proxy(Proxy.AddrList, Proxy.Option,
+				client, host, port, int(Proxy.TTL), int(Proxy.MSS), headData)
+		case proxy.MYSOCKS4A:
+			proxy.MystifySocks4aProxy(Proxy.AddrList, Proxy.Option,
+				client, host, port, int(Proxy.TTL), int(Proxy.MSS), headData)
 		case proxy.TFO:
 			proxy.TFOProxyHost(Proxy.AddrList, Proxy.Option,
 				client, host, port, int(Proxy.MSS), headData)
 		case proxy.STRIP:
 			proxy.StripHost(Proxy.AddrList, Proxy.Option,
 				client, host, port, headData)
+		case proxy.WEB:
+			proxy.WebProxyHost(client, host, Proxy.Option, headData)
+		default:
+			log.Println("No Type:", Proxy.Type)
 		}
 	}
 }
 
 func handleProxyAddr(client *net.TCPConn, Proxy *proxy.ProxyInfo, pDSTAddr *net.TCPAddr) {
+	err := client.SetReadDeadline(time.Now().Add(proxy.CONN_TTL))
+	if err != nil {
+		log.Println(err)
+	}
+	defer client.Close()
+
 	if Proxy == nil {
 		proxy.Proxy(client, pDSTAddr.String())
 	} else {
@@ -941,6 +1071,23 @@ func handleProxyAddr(client *net.TCPConn, Proxy *proxy.ProxyInfo, pDSTAddr *net.
 		case proxy.BIND:
 			proxy.BindProxyAddr(Proxy.AddrList, Proxy.Option, client,
 				pDSTAddr, int(Proxy.MSS), false)
+		case proxy.MYPROXY:
+			ip4 := pDSTAddr.IP.To4()
+			if ip4 != nil {
+				host := ip4.String()
+				port := pDSTAddr.Port
+				proxy.MystifyHTTPProxy(Proxy.AddrList, Proxy.Option,
+					client, host, port, int(Proxy.TTL), int(Proxy.MSS), nil)
+			}
+		case proxy.MYSOCKS:
+			proxy.MystifySocksProxyAddr(Proxy.AddrList, Proxy.Option,
+				client, pDSTAddr, int(Proxy.TTL), int(Proxy.MSS), nil)
+		case proxy.MYSOCKS4:
+			proxy.MystifySocks4ProxyAddr(Proxy.AddrList, Proxy.Option,
+				client, pDSTAddr, int(Proxy.TTL), int(Proxy.MSS), nil)
+		case proxy.MYSOCKS4A:
+			proxy.MystifySocks4ProxyAddr(Proxy.AddrList, Proxy.Option,
+				client, pDSTAddr, int(Proxy.TTL), int(Proxy.MSS), nil)
 		default:
 			log.Println("No Type:", Proxy.Type)
 		}
@@ -978,7 +1125,7 @@ func handleTransparent(client *net.TCPConn) {
 		truth := Nose[index]
 		handleProxyHost(client, truth.Proxy, truth.Host, pDSTAddr.Port, headData)
 	case 0x0701:
-		handleReverse(client)
+		handleReverse(client, pDSTAddr.Port)
 		return
 	default:
 		var index uint64
@@ -1014,57 +1161,70 @@ func handleSocks(client *net.TCPConn) {
 		if err != nil {
 			return
 		}
-		switch b[3] {
+		switch b[1] {
 		case 0x01:
-			index := uint64(binary.BigEndian.Uint32(b[4:8]))
-			port := int(b[n-2])<<8 | int(b[n-1])
-			pDSTAddr := &net.TCPAddr{b[4:8], port, ""}
-			Proxy, ok := ProxyMap[index]
-			if !ok {
-				Proxy, ok = ProxyMap[index&0xFFFFFF00]
+			{
+				switch b[3] {
+				case 0x01:
+					index := uint64(binary.BigEndian.Uint32(b[4:8]))
+					port := int(b[n-2])<<8 | int(b[n-1])
+					pDSTAddr := &net.TCPAddr{b[4:8], port, ""}
+					Proxy, ok := ProxyMap[index]
+					if !ok {
+						Proxy, ok = ProxyMap[index&0xFFFFFF00]
+					}
+					if !ok {
+						Proxy, ok = ProxyMap[index&0xFFFF0000]
+					}
+					if !ok {
+						Proxy = DefaultProxy
+					}
+					if LogEnable {
+						fmt.Println("SOCKS-IPv4", client.RemoteAddr(), pDSTAddr)
+					}
+					client.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+					handleProxyAddr(client, Proxy, pDSTAddr)
+				case 0x03:
+					host := string(b[5 : n-2])
+					port := int(b[n-2])<<8 | int(b[n-1])
+					cache := CacheLookup(host)
+					Proxy := cache.Proxy
+					if LogEnable {
+						fmt.Println("SOCKS", client.RemoteAddr(), host, port)
+					}
+					client.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+					handleProxyHost(client, Proxy, host, port, nil)
+				case 0x04:
+					index := binary.BigEndian.Uint64(b[4:12])
+					port := int(b[n-2])<<8 | int(b[n-1])
+					pDSTAddr := &net.TCPAddr{b[4:20], port, ""}
+					var ok bool
+					Proxy, ok := ProxyMap[index]
+					if !ok {
+						Proxy, ok = ProxyMap[index&0xFFFFFFFFFFFF0000]
+					}
+					if !ok {
+						Proxy, ok = ProxyMap[index&0xFFFFFFFF00000000]
+					}
+					if !ok {
+						log.Println(pDSTAddr, ":Unknow IP")
+						return
+					}
+					if LogEnable {
+						fmt.Println("SOCKS-IPv6", client.RemoteAddr(), pDSTAddr)
+					}
+					client.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+					handleProxyAddr(client, Proxy, pDSTAddr)
+				}
 			}
-			if !ok {
-				Proxy, ok = ProxyMap[index&0xFFFF0000]
+		case 0x02:
+			{
+				fmt.Println("BIND not Support")
 			}
-			if !ok {
-				Proxy = DefaultProxy
-			}
-			if LogEnable {
-				fmt.Println("SOCKS-IPv4", client.RemoteAddr(), pDSTAddr)
-			}
-			client.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
-			handleProxyAddr(client, Proxy, pDSTAddr)
 		case 0x03:
-			host := string(b[5 : n-2])
-			port := int(b[n-2])<<8 | int(b[n-1])
-			cache := CacheLookup(host)
-			Proxy := cache.Proxy
-			if LogEnable {
-				fmt.Println("SOCKS", client.RemoteAddr(), host, port)
+			{
+				fmt.Println("UDP ASSOCIATE not Support")
 			}
-			client.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
-			handleProxyHost(client, Proxy, host, port, nil)
-		case 0x04:
-			index := binary.BigEndian.Uint64(b[4:12])
-			port := int(b[n-2])<<8 | int(b[n-1])
-			pDSTAddr := &net.TCPAddr{b[4:20], port, ""}
-			var ok bool
-			Proxy, ok := ProxyMap[index]
-			if !ok {
-				Proxy, ok = ProxyMap[index&0xFFFFFFFFFFFF0000]
-			}
-			if !ok {
-				Proxy, ok = ProxyMap[index&0xFFFFFFFF00000000]
-			}
-			if !ok {
-				log.Println(pDSTAddr, ":Unknow IP")
-				return
-			}
-			if LogEnable {
-				fmt.Println("SOCKS-IPv6", client.RemoteAddr(), pDSTAddr)
-			}
-			client.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
-			handleProxyAddr(client, Proxy, pDSTAddr)
 		}
 	}
 }
@@ -1113,66 +1273,10 @@ func handleGlobalSocks(client *net.TCPConn, Proxy *proxy.ProxyInfo) {
 	}
 }
 
-func handleHTTP(client *net.TCPConn) {
+func handleReverse(client *net.TCPConn, port int) {
 	defer client.Close()
 
 	var host string
-	port := 0
-	var pDSTAddr *net.TCPAddr = nil
-	var Proxy *proxy.ProxyInfo = nil
-	var headData []byte
-	var b [1460]byte
-	n, err := client.Read(b[:])
-	if err != nil {
-		return
-	}
-	if n < 7 {
-		return
-	}
-
-	request := string(b[:n])
-	if request[:7] == "CONNECT" {
-		hostend := strings.Index(request[8:], " ")
-		if hostend > 0 {
-			host = request[8 : hostend+8]
-			ipv6end := strings.Index(host, "]")
-			ipv6end++
-			portstart := strings.Index(host[ipv6end:], ":")
-			if portstart > -1 {
-				portstart += ipv6end
-				port, err = strconv.Atoi(host[portstart+1:])
-				if err != nil {
-					log.Println(err)
-					return
-				}
-				host = host[:portstart]
-			} else {
-				port = 80
-			}
-
-			cache := CacheLookup(host)
-			Proxy = cache.Proxy
-			if LogEnable {
-				fmt.Println("CONNECT", host, port)
-			}
-			client.Write([]byte("HTTP/1.1 200 Tunnel established\r\n\r\n"))
-		}
-	} else {
-		proxy.HTTPProxy(client, request)
-	}
-
-	if pDSTAddr == nil {
-		handleProxyHost(client, Proxy, host, port, headData)
-	} else {
-		handleProxyAddr(client, Proxy, pDSTAddr)
-	}
-}
-
-func handleReverse(client *net.TCPConn) {
-	defer client.Close()
-
-	var host string
-	port := 0
 	var Proxy *proxy.ProxyInfo = nil
 
 	var headData []byte
@@ -1186,12 +1290,11 @@ func handleReverse(client *net.TCPConn) {
 	if b[0] == 0x16 {
 		host = proxy.GetSNI(b[:n])
 		if len(host) > 0 {
-			port = 443
 			cache := CacheLookup(host)
 			Proxy = cache.Proxy
 			if LogEnable {
 				fmt.Println("SNI", host, port)
-				if host[len(host)-5:len(host)] == ".info" {
+				if strings.HasSuffix(host, ".info") {
 					sni := base64.URLEncoding.EncodeToString(b[:n])
 					if err != nil {
 						log.Fatalln(err)
@@ -1207,22 +1310,24 @@ func handleReverse(client *net.TCPConn) {
 	} else {
 		host = proxy.GetHost(b[:n])
 		if len(host) > 0 {
-			if strings.Index(host, ":") == -1 {
-				if (host + ":80") == client.LocalAddr().String() {
-					client.Write([]byte("HTTP/1.1 301 Moved Permanently\r\nLocation: http://127.0.0.1\r\n\r\n"))
-					log.Println(client.RemoteAddr(), host, "Unauthorized Access")
-					if LogEnable {
-						fmt.Println(string(b[:n]))
+			if len(ProxyClients) == 0 {
+				if strings.Index(host, ":") == -1 {
+					if (host + ":80") == client.LocalAddr().String() {
+						//client.Write([]byte("HTTP/1.1 301 Moved Permanently\r\nLocation: http://127.0.0.1\r\n\r\n"))
+						client.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
+						log.Println(client.RemoteAddr(), host, "Unauthorized Access")
+						if LogEnable {
+							fmt.Println(string(b[:n]))
+						}
+						return
 					}
-					return
 				}
 			}
 
-			port = 80
 			cache := CacheLookup(host)
 			Proxy = cache.Proxy
 			if LogEnable {
-				fmt.Println("Reverse", host, port)
+				fmt.Println("HTTP", host, port)
 			}
 			headData = make([]byte, n)
 			copy(headData[:], b[:n])
@@ -1242,6 +1347,30 @@ func PinocchioDNS(Address net.UDPAddr) error {
 	defer udpconn.Close()
 	DNSEnable = true
 	handleDNSServer(udpconn, RandPort)
+	return nil
+}
+
+func PinocchioDNSoverTCP(ProxyAddress net.TCPAddr) error {
+	l, err := net.ListenTCP("tcp", &ProxyAddress)
+	if err != nil {
+		return err
+	}
+	defer l.Close()
+
+	if LogEnable {
+		fmt.Println("DNSoverTCP:", ProxyAddress.String())
+	}
+
+	for {
+		client, err := l.AcceptTCP()
+		if err != nil {
+			log.Println(err)
+			time.Sleep(time.Second * 2)
+			continue
+		}
+
+		go handleDNSoverTCP(client)
+	}
 	return nil
 }
 
@@ -1407,45 +1536,6 @@ func SocksProxy(ProxyAddress net.TCPAddr, Authentication string, Quote string) e
 	return nil
 }
 
-func HTTPProxy(ProxyAddress net.TCPAddr) error {
-	proxy.LogEnable = LogEnable
-	l, err := net.ListenTCP("tcp", &ProxyAddress)
-	if err != nil {
-		return err
-	}
-	defer l.Close()
-
-	if LogEnable {
-		fmt.Println("HTTPProxy:", ProxyAddress.String())
-	}
-
-	for {
-		client, err := l.AcceptTCP()
-		if err != nil {
-			log.Println(err)
-			time.Sleep(time.Second * 2)
-			continue
-		}
-
-		if len(ProxyClients) > 0 {
-			RemoteAddr := client.RemoteAddr()
-			RemoteTCPAddr, _ := net.ResolveTCPAddr(RemoteAddr.Network(), RemoteAddr.String())
-			strIP := RemoteTCPAddr.IP.String()
-			_, ok := ProxyClients[strIP]
-			if !ok {
-				if LogEnable {
-					fmt.Println(strIP, "Forbidden")
-				}
-				client.Close()
-				continue
-			}
-		}
-
-		go handleHTTP(client)
-	}
-	return nil
-}
-
 func ReverseProxy(ProxyAddress net.TCPAddr) error {
 	proxy.LogEnable = LogEnable
 	go PinocchioQUICProxy(net.UDPAddr(ProxyAddress))
@@ -1483,7 +1573,7 @@ func ReverseProxy(ProxyAddress net.TCPAddr) error {
 			}
 		}
 
-		go handleReverse(client)
+		go handleReverse(client, ProxyAddress.Port)
 	}
 	return nil
 }

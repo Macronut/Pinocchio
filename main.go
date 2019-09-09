@@ -11,9 +11,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"./dns"
@@ -176,10 +176,20 @@ func handleLoadConfig(line string) error {
 					proxyType = proxy.MYHTTP
 				} else if netInfo[0] == "myhttp6" {
 					proxyType = proxy.MYHTTP6
+				} else if netInfo[0] == "myproxy" {
+					proxyType = proxy.MYPROXY
+				} else if netInfo[0] == "mysocks" {
+					proxyType = proxy.MYSOCKS
+				} else if netInfo[0] == "mysocks4" {
+					proxyType = proxy.MYSOCKS4
+				} else if netInfo[0] == "mysocks4a" {
+					proxyType = proxy.MYSOCKS4A
 				} else if netInfo[0] == "tfo" {
 					proxyType = proxy.TFO
 				} else if netInfo[0] == "strip" {
 					proxyType = proxy.STRIP
+				} else if netInfo[0] == "web" {
+					proxyType = proxy.WEB
 				} else {
 					log.Println(string(line))
 					return nil
@@ -218,7 +228,7 @@ func handleLoadConfig(line string) error {
 
 						serverAddr, err := net.ResolveTCPAddr("tcp", addr)
 						if err != nil {
-							log.Println(err)
+							log.Println(line, err)
 							continue
 						}
 						addrlist = append(addrlist, proxy.AddrInfo{*serverAddr, iface})
@@ -291,13 +301,6 @@ func handleLoadConfig(line string) error {
 						option = config[3]
 					}
 					go service.SocksProxy(*serverAddr, config[1], option)
-				} else if configType[1] == "http" {
-					serverAddr, err := net.ResolveTCPAddr("tcp", config[2])
-					if err != nil {
-						log.Println(line)
-						return nil
-					}
-					go service.HTTPProxy(*serverAddr)
 				} else if configType[1] == "reverse" {
 					serverAddr, err := net.ResolveTCPAddr("tcp", config[2])
 					if err != nil {
@@ -398,6 +401,9 @@ func handleLoadConfig(line string) error {
 				var fakeTTL int
 				fakeTTL, err = strconv.Atoi(configType[1])
 				service.DefaultFakeTTL = uint8(fakeTTL)
+			} else if configType[0] == "fake-ip" {
+				fake_ip := net.ParseIP(configType[1])
+				service.DefaultFakeAnswer = dns.PackAnswers([]net.IP{fake_ip})
 			} else if configType[0] == "domain-needed" {
 				service.DomainNeeded = true
 			} else if configType[0] == "bogus-priv" {
@@ -453,20 +459,16 @@ func handleLoadConfigFile(path string) error {
 }
 
 func main() {
-	runtime.GOMAXPROCS(1)
-
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	Args := os.Args
 	fmt.Println(Args)
 
 	argcount := len(Args)
-
-	//Config
-	service.CacheMap = make(map[string]service.DNSCache)
-	service.ProxyMap = make(map[uint64]*proxy.ProxyInfo)
-	service.ProxyClients = make(map[string]bool)
-
 	if argcount > 1 {
+		//Config
+		service.CacheMap = make(map[string]service.DNSCache)
+		service.ProxyMap = make(map[uint64]*proxy.ProxyInfo)
+		service.ProxyClients = make(map[string]bool)
 
 		for _, arg := range Args[:] {
 			if arg == "-4" {
@@ -486,15 +488,8 @@ func main() {
 			}
 		}
 	} else {
-		//fmt.Println("-4 IPv4\r\n-6 IPv6\r\n-r Random DNS Port\r\n")
-		//return
-
-		service.DNSMode = 4
-		err := handleLoadConfigFile("pino.conf")
-		if err != nil {
-			log.Println(err)
-			return
-		}
+		fmt.Println("-4 IPv4\r\n-6 IPv6\r\n-r Random DNS Port\r\n")
+		return
 	}
 
 	if DNSPort != 0 {
@@ -513,32 +508,39 @@ func main() {
 		}
 
 		if len(ListenAddress) > 0 {
-			for i := (len(ListenAddress) - 1); i > 0; i-- {
+			for i := 0; i < len(ListenAddress); i++ {
 				if service.LogEnable {
 					fmt.Println("DNSServer:", ListenAddress[i])
 				}
 				go service.PinocchioDNS(*ListenAddress[i])
-			}
-			if service.LogEnable {
-				fmt.Println("DNSServer:", ListenAddress[0])
-			}
-
-			err := service.PinocchioDNS(*ListenAddress[0])
-			if err != nil {
-				log.Println(err)
+				if service.LogEnable {
+					fmt.Println("DNSServer:", ListenAddress[i])
+				}
 			}
 		} else {
-			addr, err := net.ResolveUDPAddr("udp", ":"+strconv.Itoa(DNSPort))
-			err = service.PinocchioDNS(*addr)
+			tcpaddr, err := net.ResolveTCPAddr("tcp", ":"+strconv.Itoa(DNSPort))
 			if err != nil {
 				log.Println(err)
 			}
+			go service.PinocchioDNSoverTCP(*tcpaddr)
+
+			addr, err := net.ResolveUDPAddr("udp", ":"+strconv.Itoa(DNSPort))
+			if err != nil {
+				log.Println(err)
+			}
+			go service.PinocchioDNS(*addr)
 		}
-	} else {
-		addr, err := net.ResolveUDPAddr("udp", "127.0.0.1:53")
-		err = service.PinocchioDNS(*addr)
-		if err != nil {
-			log.Println(err)
+	}
+
+	var input string
+	for {
+		fmt.Scanln(&input)
+		if input == "exit" {
+			return
+		} else if input == "" {
+			var wg sync.WaitGroup
+			wg.Add(1)
+			wg.Wait()
 		}
 	}
 }

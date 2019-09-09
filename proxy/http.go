@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	//"encoding/binary"
 	"log"
 	"math/rand"
 	"net"
@@ -135,16 +134,17 @@ func HTTPProxyHost(serverAddrList []AddrInfo, client net.Conn, host string, port
 		if err != nil {
 			log.Println(err)
 			return
-		}
-		_, err = server.Read(b[:])
-		if err != nil {
-			log.Println(err)
-			return
-		}
+		} else {
+			n, err := server.Read(b[:])
+			if err != nil {
+				log.Println(err)
+				return
+			}
 
-		if string(b[:13]) != "HTTP/1.1 200 " {
-			log.Println(string(b[:15]))
-			return
+			if string(b[:13]) != "HTTP/1.1 200 " {
+				log.Println(string(b[:n]))
+				return
+			}
 		}
 
 		_, err = server.Write(data[:n])
@@ -160,112 +160,4 @@ func HTTPProxyHost(serverAddrList []AddrInfo, client net.Conn, host string, port
 
 func HTTPProxyAddr(serverAddrList []AddrInfo, client net.Conn, address *net.TCPAddr) {
 	HTTPProxyHost(serverAddrList, client, address.IP.String(), address.Port)
-}
-
-func HTTPProxy(client net.Conn, request string) {
-	defer client.Close()
-
-	hoststart := strings.Index(request, " ")
-	if hoststart <= 0 {
-		return
-	}
-	hoststart += 8
-	hostend := strings.Index(request[hoststart:], "/")
-	if hostend <= 0 {
-		return
-	}
-	host := request[hoststart : hoststart+hostend]
-	addr := host
-	if len(host) == strings.Index(host, "]")+1 {
-		addr += ":80"
-	} else if strings.Index(host, ":") == -1 {
-		addr += ":80"
-	}
-
-	server, err := net.Dial("tcp", addr)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-	defer server.Close()
-	go Forward(server, client)
-
-	dataSize := 0
-	data := make([]byte, BUFFER_SIZE)
-	for {
-		method := ""
-		resource := ""
-		field := ""
-		end := strings.Index(request, "\r\n\r\n")
-		if end > 0 {
-			resStart := strings.Index(request, " ")
-			if resStart > 0 {
-				resStart++
-				method = request[:resStart]
-				fieldStart := strings.Index(request, "\r\n")
-				if fieldStart > 0 {
-					fieldStart += 2
-					resource = request[resStart+7+hostend : fieldStart]
-				}
-
-				if strings.Index(request, "Host: ") < 0 {
-					resource += resource + "Host: " + host + "\r\n"
-				}
-
-				contentLen := strings.Index(request, "Content-Length: ")
-				if contentLen > 0 {
-					contentLen += 16
-					contentLenEnd := strings.Index(request[contentLen:], "\r\n")
-					if contentLenEnd <= 0 {
-						return
-					}
-					contentLenEnd += contentLen
-					dataSize, err = strconv.Atoi(request[contentLen:contentLenEnd])
-					if err != nil {
-						log.Println(err)
-						return
-					}
-				} else {
-					dataSize = 0
-				}
-
-				end += 4
-
-				if len(request[end:]) < dataSize {
-					dataSize -= len(request[end:])
-					field = request[fieldStart:]
-					request = ""
-				} else {
-					field = request[fieldStart : end+dataSize]
-					request = request[end+dataSize:]
-					dataSize = 0
-				}
-
-				_, err = server.Write([]byte(method + resource + field))
-				if err != nil {
-					log.Println(err)
-					return
-				}
-			}
-		}
-
-		n, _ := client.Read(data[:])
-		if n <= 0 {
-			return
-		}
-
-		if dataSize > 0 {
-			if n < dataSize {
-				_, err = server.Write(data[:n])
-				dataSize -= n
-				continue
-			} else {
-				_, err = server.Write(data[:dataSize])
-				request = string(data[dataSize:n])
-				dataSize = 0
-			}
-		} else {
-			request += string(data[:n])
-		}
-	}
 }
